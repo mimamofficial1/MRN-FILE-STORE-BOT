@@ -44,13 +44,13 @@ class StreamXBot(Client):
                     print(message.text)
         """
         current = offset
-        while True:
-            new_diff = min(200, limit - current)
-            if new_diff <= 0:
-                return
-            messages = await self.get_messages(chat_id, list(range(current, current+new_diff+1)))
+        while current <= limit:
+            # at most 200 ids per request, both ends inclusive; progress is
+            # driven by the ids we asked for (not by how many came back)
+            ids = list(range(current, min(current + 199, limit) + 1))
+            messages = await self.get_messages(chat_id, ids)
             for message in messages:
                 yield message
-                current += 1
+            current = ids[-1] + 1
       
 StreamBot = StreamXBot()
