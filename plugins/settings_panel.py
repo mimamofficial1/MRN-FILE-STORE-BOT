@@ -15,12 +15,13 @@ from plugins.admins_db import dynamic_admin_filter, is_admin, has_permission, ge
 
 def main_menu_text(settings):
     last_used = readable_ago(settings.get("last_used"))
+    last_used_line = f"{last_used}" if last_used == "Never" else f"{last_used} Ago"
     return (
-        "⚙️ <b>ᴍʀɴ ʙᴏᴛ ꜱᴇᴛᴛɪɴɢꜱ ᴘᴀɴᴇʟ</b>\n"
-        "➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n\n"
-        "🍿 <i>Customise every feature of your MRN bot right from here.</i>\n\n"
-        f"⏰ <b>Last Used :</b> {last_used} ago\n\n"
-        "👇 <b>Choose an option below</b>"
+        "⚙️ <u><b>Mrn Manage Bot • Settings</b></u>\n\n"
+        "🤖 <u>Welcome To The Mrn Bot Control Panel</u>\n\n"
+        "🛠 <u>Manage Your Bot Features, Preferences &amp; Controls From One Place.</u>\n\n"
+        f"🕐 <u>Last Used: {last_used_line}</u>\n\n"
+        "👇 <u>Choose A Setting To Continue</u>"
     )
 
 
