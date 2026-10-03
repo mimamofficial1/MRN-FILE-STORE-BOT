@@ -383,8 +383,8 @@ async def start(client, message):
                 f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
-                f"🤵 Powered By @Mrn_Officialx ⚡\n\n"
-                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
+                f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
+                f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
             _spawn(_delete_batch_later(settings.get("auto_delete_time", 1800), filesarr, k))
         return
@@ -459,8 +459,8 @@ async def start(client, message):
                 f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
-                f"🤵 Powered By @Mrn_Officialx ⚡\n\n"
-                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
+                f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
+                f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
             _spawn(_delete_single_later(settings.get("auto_delete_time", 1800), del_msg, k))
         return
