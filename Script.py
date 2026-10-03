@@ -1,7 +1,7 @@
 
 
 class script(object):
-    START_TXT = """Hey 🎵🦋{}🎵❤️ !! 💌
+    START_TXT = """Hey {} !! 💌
 
 Welcome To Mrn Officialx File Store Bot! ✨❤️
 
@@ -10,13 +10,11 @@ Welcome To Mrn Officialx File Store Bot! ✨❤️
 🤵 Powered By @Mrn_Officialx
 
 💬 Need Help, Have A Request, Query, Or Feedback? We're Here To Help.
-🤵 Contact >>> @Mimam_Officialx"""
+🤵 Contact >>> @Mrn_Contact_Bot"""
 
 
     
-    CAPTION = """<b><a href="https://t.me/Mrn_Officialx">{file_caption}</a></b>
-<b>➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖
-👑 ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ ➥ https://t.me/Mrn_Officialx/6</b>"""
+    CAPTION = """<b>{file_caption}</b>"""
 
 
     SHORTENER_API_MESSAGE = """<b>Tᴏ ᴀᴅᴅ ᴏʀ ᴜᴘᴅᴀᴛᴇ ʏᴏᴜʀ Sʜᴏʀᴛɴᴇʀ Wᴇʙsɪᴛᴇ API, /api (ᴀᴘɪ)
@@ -34,15 +32,15 @@ If You Want To Remove Api Then Copy This And Send To Bot - `/api None`"""
 
 🤖 ᴍʏ ɴᴀᴍᴇ: {}
 
-📝 ʟᴀɴɢᴜᴀɢᴇ: <a href=https://www.python.org>𝐏𝐲𝐭𝐡𝐨𝐧𝟑</a>
+📝 ʟᴀɴɢᴜᴀɢᴇ: <a href=https://www.python.org>Python3</a>
 
-📚 ʟɪʙʀᴀʀʏ: <a href=https://docs.pyrogram.org>𝐏𝐲𝐫𝐨𝐠𝐫𝐚𝐦</a>
+📚 ʟɪʙʀᴀʀʏ: <a href=https://docs.pyrogram.org>Pyrogram</a>
 
-🇮🇳 ᴅᴇᴠᴇʟᴏᴘᴇʀ: <a href=https://t.me/mimam_officialx>꧁𓊈𒆜𝖒𝖎𝖒𝖆𝖒_𝖔𝖋𝖋𝖎𝖈𝖎𝖆𝖑𒆜𓊉꧂</a>
+🇮🇳 ᴅᴇᴠᴇʟᴏᴘᴇʀ: <a href=https://t.me/mimam_officialx>Mimam</a>
 
-👥 sᴜᴘᴘᴏʀᴛ ɢʀᴏᴜᴘ: <a href=https://t.me/+LwFYMVKvg3FhODdl>𝖒𝖗𝖓 𝖙𝖛 𝖇𝖆𝖈𝖐-𝖚𝖕</a>
+👥 sᴜᴘᴘᴏʀᴛ: <a href=https://t.me/MRN_CONTACT_BOT>Contact Bot</a>
 
-📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ: <a href=https://t.me/Mrn_Officialx>𝖒𝖗𝖓 𝖚𝖕𝖉𝖆𝖙𝖊 𝖈𝖍𝖆𝖓𝖓𝖊𝖑</a></b>
+📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ: <a href=https://t.me/Mrn_Officialx>MRN_Officialx</a></b>
 """
 
     CABOUT_TXT = """<b>ʜɪ ɪ ᴀᴍ ᴘᴇʀᴍᴀɴᴇɴᴛ ғɪʟᴇ sᴛᴏʀᴇ ʙᴏᴛ ᴡɪᴛʜ ᴄʟᴏɴᴇ ғᴇᴀᴛᴜʀᴇ + ᴄᴜsᴛᴏᴍ ᴜʀʟ sʜᴏʀᴛɴᴇʀ ɪᴛ ᴍᴇᴀɴs ᴀɴʏ ᴜsᴇʀ ᴄᴀɴ sᴇᴛ ʜɪs ᴜʀʟ sʜᴏʀᴛɴᴇʀ ᴀɴᴅ + ᴀᴜᴛᴏ ᴅᴇʟᴇᴛᴇ.
