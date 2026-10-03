@@ -58,5 +58,13 @@ class Database:
         count = await self.col.count_documents({'banned': True})
         return count
 
+    async def ensure_indexes(self):
+        """Every /start, every genlink ban-check etc. looks a user up by
+        'id' - without an index each of those does a full collection scan,
+        getting slower as the user base grows. Non-unique on purpose: if any
+        duplicate/mixed-type 'id' values already exist in production, a
+        unique index would fail to build and could crash startup."""
+        await self.col.create_index("id")
+
 
 db = Database(DB_URI, DB_NAME)

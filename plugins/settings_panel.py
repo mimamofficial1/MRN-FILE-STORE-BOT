@@ -10,7 +10,7 @@ from plugins.settings_db import (
     touch_last_used, readable_ago, add_custom_button, remove_custom_button, clear_custom_buttons,
     force_sub_channel_id, force_sub_channel_mode, force_sub_channel_link, set_force_sub_link
 )
-from plugins.admins_db import dynamic_admin_filter, is_admin, get_all_admins, add_admin, remove_admin, set_permission, PERMISSIONS
+from plugins.admins_db import dynamic_admin_filter, is_admin, has_permission, get_all_admins, add_admin, remove_admin, set_permission, PERMISSIONS
 
 
 def main_menu_text(settings):
@@ -112,6 +112,8 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
 
     # ---------------- Restart Bot ----------------
     elif data == "adm_restart":
+        if not await has_permission(user.id, "can_manage_admins"):
+            return await query.answer("Only admins with 'Can Manage Admins' permission can restart the bot.", show_alert=True)
         await query.message.edit_text("<b>♻️ Restarting bot, please wait...</b>")
         import os, sys
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -121,6 +123,8 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
         await render_admins_menu(query)
 
     elif data == "adm_admins_add":
+        if not await has_permission(user.id, "can_manage_admins"):
+            return await query.answer("You don't have permission to manage admins.", show_alert=True)
         await query.message.reply_text(
             "<b>Send the user ID to make admin, or forward a message from them.</b>\n/cancel to cancel."
         )
@@ -160,6 +164,8 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
         await render_admin_detail(query, target_id)
 
     elif data.startswith("adm_admin_toggle_"):
+        if not await has_permission(user.id, "can_manage_admins"):
+            return await query.answer("You don't have permission to manage admins.", show_alert=True)
         # data format: adm_admin_toggle_<perm>_<id>
         parts = data.split("_")
         target_id = int(parts[-1])
@@ -171,6 +177,8 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
         await render_admin_detail(query, target_id)
 
     elif data.startswith("adm_admin_remove_"):
+        if not await has_permission(user.id, "can_manage_admins"):
+            return await query.answer("You don't have permission to manage admins.", show_alert=True)
         target_id = int(data.replace("adm_admin_remove_", "", 1))
         await remove_admin(target_id)
         await query.answer("Admin removed.", show_alert=True)

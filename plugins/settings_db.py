@@ -182,6 +182,13 @@ async def clear_join_request(user_id, channel_id):
     await _join_requests_col.delete_one({"user_id": int(user_id), "channel_id": int(channel_id)})
 
 
+async def ensure_join_request_indexes():
+    """Every join-request check/record/clear queries by the (user_id,
+    channel_id) pair - index it so that doesn't become a full collection
+    scan as more people use force-sub-via-join-request."""
+    await _join_requests_col.create_index([("user_id", 1), ("channel_id", 1)])
+
+
 async def clear_all_join_requests():
     """Manual safety net for admins: wipe every recorded join request so
     everyone has to send a fresh request. Useful if you ever suspect some

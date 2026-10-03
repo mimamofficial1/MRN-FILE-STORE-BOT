@@ -27,6 +27,18 @@ async def allowed(_, __, message):
     return False
 
 
+async def batch_allowed(_, __, message):
+    # /batch lets you dump an entire range of messages from any channel the
+    # BOT happens to have access to - that's a much bigger blast radius than
+    # a single uploaded file, and public_mode was never meant to extend that
+    # far (there's no concept of the requesting user actually owning/admin-ing
+    # the source channel). So /batch always requires a bot admin, regardless
+    # of public_mode.
+    if message.from_user and await db.is_user_banned(message.from_user.id):
+        return False
+    return bool(message.from_user) and (message.from_user.id in ADMINS or await is_admin(message.from_user.id))
+
+
 @Client.on_message((filters.document | filters.video | filters.audio) & filters.private & filters.create(allowed))
 async def incoming_gen_link(bot, message):
     username = (await bot.get_me()).username
@@ -96,7 +108,7 @@ def _extract_batch_ref(msg):
     return None
 
 
-@Client.on_message(filters.command(['batch']) & filters.create(allowed))
+@Client.on_message(filters.command(['batch']) & filters.create(batch_allowed))
 async def gen_link_batch(bot, message):
     username = (await bot.get_me()).username
 

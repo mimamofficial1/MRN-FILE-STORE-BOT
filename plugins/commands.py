@@ -52,7 +52,6 @@ def stream_download_buttons(chat_id, message_id, media):
     try:
         download_url, watch_url = build_stream_urls(
             chat_id, message_id,
-            getattr(media, "file_unique_id", ""),
             getattr(media, "file_name", "") or "file",
         )
         return [[
@@ -171,15 +170,16 @@ async def start(client, message):
             disable_web_page_preview=True
         )
 
-    if len(message.command) != 2:
+    async def send_main_menu():
+        """The default /start greeting (menu + custom/default welcome photo).
+        Used for a plain /start, and as a safe fallback whenever a start
+        parameter turns out to not be a real, decodable file link."""
         buttons = [[
+            InlineKeyboardButton('🤵 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📣 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
+            ],[
             InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
             InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
-            ],[
-            InlineKeyboardButton('⚜️ sᴜʙsᴄʀɪʙᴇ ᴍʏ ᴛᴇʟᴇɢʀᴀᴍ ᴄʜᴀɴɴᴇʟ ⚜️', url='https://t.me/Mrn_Officialx')
-            ],[
-            InlineKeyboardButton('♻️ ᴀʟʟ ʀᴇǫᴜᴇsᴛ ɢʀᴏᴜᴘ ♻️', url='https://t.me/+T5B4zp8-Wjg5MTU9'),
-            InlineKeyboardButton('🥰 ʀᴇᴀʟɪᴛʏ ᴛᴠ sʜᴏᴡs 🥰', url='https://t.me/+MdUPwSnwvP0zN2U1')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
         me = client.me
@@ -202,6 +202,9 @@ async def start(client, message):
                 caption=start_caption,
                 reply_markup=reply_markup
             )
+
+    if len(message.command) != 2:
+        await send_main_menu()
         return
 
     
@@ -318,10 +321,7 @@ async def start(client, message):
                         f_caption=f_caption
                 if f_caption is None:
                     f_caption = f"{title}"
-                button = [[
-                    InlineKeyboardButton('🌺 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ 🌺', url='https://t.me/+PArBpI-yLp5hMjQ1'),
-                    InlineKeyboardButton('💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs 💎', url='https://t.me/MRN_Officialx/6')
-                ]]
+                button = []
                 for row in (settings.get("custom_buttons") or []):
                     button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
                 button.extend(stream_download_buttons(channel_id, msgid, file))
@@ -337,10 +337,7 @@ async def start(client, message):
             else:
                 title = "Unknown File"
                 protect = settings.get("protect_content", False)
-                button = [[
-                    InlineKeyboardButton('🌺 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ 🌺', url='https://t.me/+PArBpI-yLp5hMjQ1'),
-                    InlineKeyboardButton('💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs 💎', url='https://t.me/MRN_Officialx/6')
-                ]]
+                button = []
                 for row in (settings.get("custom_buttons") or []):
                     button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
                 reply_markup = InlineKeyboardMarkup(button)
@@ -385,7 +382,14 @@ async def start(client, message):
         return
 
 
-    pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
+    try:
+        pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
+    except Exception:
+        # Not a real file link (e.g. the "?start=true" Continue button used after
+        # force-sub when there was no original deep-link param) - just greet them
+        # instead of crashing silently with no reply at all.
+        await send_main_menu()
+        return
     if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
         btn = [[
             InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
@@ -414,10 +418,7 @@ async def start(client, message):
                     f_caption=single_caption.format(file_name= '' if title is None else title, file_size='' if size is None else size, file_caption='' if title is None else title)
                 except:
                     f_caption = f"<code>{title}</code>"
-            button = [[
-                InlineKeyboardButton('🌺 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ 🌺', url='https://t.me/+PArBpI-yLp5hMjQ1'),
-                InlineKeyboardButton('💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs 💎', url='https://t.me/MRN_Officialx/6')
-            ]]
+            button = []
             for row in (settings.get("custom_buttons") or []):
                 button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
             button.extend(stream_download_buttons(msg.chat.id, msg.id, media))
@@ -425,10 +426,7 @@ async def start(client, message):
             del_msg = await msg.copy(chat_id=message.from_user.id, caption=f_caption, reply_markup=reply_markup, protect_content=settings.get("protect_content", False))
         else:
             title = "Unknown File"
-            button = [[
-                InlineKeyboardButton('🌺 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ 🌺', url='https://t.me/+PArBpI-yLp5hMjQ1'),
-                InlineKeyboardButton('💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴs 💎', url='https://t.me/MRN_Officialx/6')
-            ]]
+            button = []
             for row in (settings.get("custom_buttons") or []):
                 button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
             reply_markup = InlineKeyboardMarkup(button)
@@ -534,26 +532,36 @@ async def cb_handler(client: Client, query: CallbackQuery):
     
     elif query.data == "start":
         buttons = [[
+            InlineKeyboardButton('🤵 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📣 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
+            ],[
             InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
             InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
-            ],[
-            InlineKeyboardButton('⚜️ sᴜʙsᴄʀɪʙᴇ ᴍʏ ᴛᴇʟᴇɢʀᴀᴍ ᴄʜᴀɴɴᴇʟ ⚜️', url='https://t.me/Mrn_Officialx')
-            ],[
-            InlineKeyboardButton('♻️ ᴀʟʟ ʀᴇǫᴜᴇsᴛ ɢʀᴏᴜᴘ ♻️', url='https://t.me/+T5B4zp8-Wjg5MTU9'),
-            InlineKeyboardButton('🥰 ʀᴇᴀʟɪᴛʏ ᴛᴠ sʜᴏᴡs 🥰', url='https://t.me/+MdUPwSnwvP0zN2U1')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
-        await client.edit_message_media(
-            query.message.chat.id, 
-            query.message.id, 
-            InputMediaPhoto(random.choice(PICS))
-        )
+        settings = await get_settings()
         me2 = (await client.get_me()).mention
-        await query.message.edit_text(
-            text=script.START_TXT.format(query.from_user.mention, me2),
-            reply_markup=reply_markup,
-            parse_mode=enums.ParseMode.HTML
-        )
+        start_caption = settings.get("start_message") or script.START_TXT
+        try:
+            start_caption = start_caption.format(query.from_user.mention, me2)
+        except (IndexError, KeyError):
+            pass
+        start_photo = settings.get("start_photo") or random.choice(PICS)
+        try:
+            await client.edit_message_media(
+                query.message.chat.id,
+                query.message.id,
+                InputMediaPhoto(start_photo, caption=start_caption, parse_mode=enums.ParseMode.HTML),
+            )
+            await query.message.edit_reply_markup(reply_markup=reply_markup)
+        except Exception:
+            # bad/expired custom start_photo file_id -> fall back to default pic
+            await client.edit_message_media(
+                query.message.chat.id,
+                query.message.id,
+                InputMediaPhoto(random.choice(PICS), caption=start_caption, parse_mode=enums.ParseMode.HTML),
+            )
+            await query.message.edit_reply_markup(reply_markup=reply_markup)
 
     
     elif query.data == "help":
