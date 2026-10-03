@@ -51,6 +51,11 @@ class StreamXBot(Client):
             messages = await self.get_messages(chat_id, ids)
             for message in messages:
                 yield message
-            current = ids[-1] + 1
+            # Continue after the last message Telegram actually returned. If it
+            # ever answers with fewer than the ids we asked for (a server-side
+            # cap), nothing is skipped; if it returns all of them, same result
+            # as before. max() guarantees forward progress.
+            last_seen = messages[-1].id if messages else ids[-1]
+            current = max(current + 1, last_seen + 1)
       
 StreamBot = StreamXBot()
