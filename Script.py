@@ -7,11 +7,11 @@ Welcome To Mrn Officialx File Store Bot! ✨❤️
 
 📂 Access Your Content Easily Through The Links Provided. ⚡
 
-🤵 Powered By @Mrn_Officialx
+👨‍💻 Powered By @Mrn_Officialx
 
 💬 Need Help, Have A Request, Query, Or Feedback? We're Here To Help.
 
-🤵 Contact >>> @Mrn_Contact_Bot</b>"""
+🧑‍🔧 Contact >>> @Mrn_Contact_Bot</b>"""
 
 
     
