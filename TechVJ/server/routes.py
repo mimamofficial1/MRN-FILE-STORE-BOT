@@ -8,8 +8,8 @@ from TechVJ.utils.watchdog import is_bot_healthy
 from TechVJ.server.streamer import (
     InvalidStreamHash,
     StreamFileNotFound,
-    decode_stream_token,
     render_watch_page,
+    resolve_stream_token,
     stream_media,
 )
 from config import STREAM_MODE
@@ -67,9 +67,10 @@ async def download_route_handler(request: web.Request):
     if not STREAM_MODE:
         raise web.HTTPNotFound(text="Streaming is disabled on this bot.")
     try:
-        chat_id, message_id = decode_stream_token(request.match_info["token"])
         secure_hash = request.rel_url.query.get("hash", "")
-        return await stream_media(request, chat_id, message_id, secure_hash)
+        # Signature + expiry are checked here, before any Telegram API call.
+        chat_id, message_id = resolve_stream_token(request.match_info["token"], secure_hash)
+        return await stream_media(request, chat_id, message_id)
     except InvalidStreamHash as e:
         raise web.HTTPForbidden(text=e.message)
     except StreamFileNotFound as e:
@@ -90,10 +91,11 @@ async def watch_route_handler(request: web.Request):
     if not STREAM_MODE:
         raise web.HTTPNotFound(text="Streaming is disabled on this bot.")
     try:
-        chat_id, message_id = decode_stream_token(request.match_info["token"])
         secure_hash = request.rel_url.query.get("hash", "")
-        html = await render_watch_page(chat_id, message_id, secure_hash)
-        return web.Response(text=html, content_type="text/html")
+        # Signature + expiry are checked here, before any Telegram API call.
+        chat_id, message_id = resolve_stream_token(request.match_info["token"], secure_hash)
+        html_out = await render_watch_page(chat_id, message_id)
+        return web.Response(text=html_out, content_type="text/html")
     except InvalidStreamHash as e:
         raise web.HTTPForbidden(text=e.message)
     except StreamFileNotFound as e:

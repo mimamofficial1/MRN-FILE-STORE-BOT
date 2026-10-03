@@ -25,9 +25,13 @@ a lot of the reference bots this technique is copied from):
 """
 
 import base64
+import hashlib
+import hmac
+import html
 import logging
 import math
 import mimetypes
+import time
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
@@ -37,7 +41,7 @@ from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
 
-from config import URL
+from config import BOT_TOKEN, STREAM_LINK_TTL, URL
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +58,35 @@ class InvalidStreamHash(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Token = base64("<chat_id>:<message_id>"), URL-safe, no padding.
+# Token = base64("<chat_id>:<message_id>:<issued_at>"), URL-safe, no padding.
+# The "hash" query param is an HMAC-SHA256 signature (keyed with the bot's own
+# token, which an attacker can't know) over that same triple, truncated to 16
+# hex chars (64 bits) - far stronger than slicing a few characters off the
+# file's own file_unique_id, which (a) has much lower real entropy than its
+# length suggests, since Telegram's unique-id encoding front-loads structural
+# bytes, and (b) could only be checked AFTER already calling Telegram's API to
+# fetch the message, making every guess cost nothing to try locally once that
+# message was ever cached. Signing the token itself means the signature can be
+# verified BEFORE touching Telegram at all, and the embedded timestamp lets a
+# link expire (STREAM_LINK_TTL, 0 = never).
 # ---------------------------------------------------------------------------
 
-def encode_stream_token(chat_id: int, message_id: int) -> str:
-    raw_token = f"{chat_id}:{message_id}".encode("ascii")
+def encode_stream_token(chat_id: int, message_id: int, issued_at: Optional[int] = None) -> str:
+    issued_at = int(time.time()) if issued_at is None else issued_at
+    raw_token = f"{chat_id}:{message_id}:{issued_at}".encode("ascii")
     return base64.urlsafe_b64encode(raw_token).decode("ascii").rstrip("=")
 
 
-def decode_stream_token(token: str) -> Tuple[int, int]:
+def decode_stream_token(token: str) -> Tuple[int, int, int]:
     padded = token + "=" * (-len(token) % 4)
-    chat_id_str, message_id_str = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii").split(":", 1)
-    return int(chat_id_str), int(message_id_str)
+    chat_id_str, message_id_str, issued_at_str = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii").split(":", 2)
+    return int(chat_id_str), int(message_id_str), int(issued_at_str)
+
+
+def _compute_signature(chat_id: int, message_id: int, issued_at: int) -> str:
+    msg = f"{chat_id}:{message_id}:{issued_at}".encode("ascii")
+    key = (BOT_TOKEN or "insecure-fallback-key").encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
 
 
 def get_media_from_message(message) -> Any:
@@ -76,32 +97,45 @@ def get_media_from_message(message) -> Any:
     return None
 
 
-def get_hash(media) -> str:
-    return (getattr(media, "file_unique_id", "") or "")[:6]
+def resolve_stream_token(token: str, provided_sig: str) -> Tuple[int, int]:
+    """Decode a /dl/ or /watch/ token and verify its signature + expiry
+    BEFORE any Telegram API call is made. Raises InvalidStreamHash if the
+    token is malformed, the signature doesn't match, or the link expired."""
+    try:
+        chat_id, message_id, issued_at = decode_stream_token(token)
+    except Exception:
+        raise InvalidStreamHash
+    expected = _compute_signature(chat_id, message_id, issued_at)
+    if not hmac.compare_digest(expected, provided_sig or ""):
+        raise InvalidStreamHash
+    if STREAM_LINK_TTL and (int(time.time()) - issued_at) > STREAM_LINK_TTL:
+        raise InvalidStreamHash
+    return chat_id, message_id
 
 
-def _dl_url(chat_id: int, message_id: int, file_unique_id: str, file_name: str, force_download: bool) -> str:
-    token = encode_stream_token(chat_id, message_id)
-    secure_hash = (file_unique_id or "")[:6]
+def _dl_url(chat_id: int, message_id: int, file_name: str, force_download: bool, issued_at: int) -> str:
+    token = encode_stream_token(chat_id, message_id, issued_at)
+    sig = _compute_signature(chat_id, message_id, issued_at)
     safe_name = urllib.parse.quote(file_name or "file")
     base = URL if URL.endswith("/") else URL + "/"
-    query = f"hash={secure_hash}"
+    query = f"hash={sig}"
     if force_download:
         query += "&dl=1"  # tells stream_media() to send Content-Disposition: attachment
     return f"{base}dl/{token}/{safe_name}?{query}"
 
 
-def build_stream_urls(chat_id: int, message_id: int, file_unique_id: str, file_name: str) -> Tuple[str, str]:
+def build_stream_urls(chat_id: int, message_id: int, file_name: str) -> Tuple[str, str]:
     """Build (download_url, watch_url) for a file already sitting at
     (chat_id, message_id) - no network call, pure string building.
     download_url forces an actual download (dl=1); watch_url opens the
     HTML player page, whose <video>/<audio> src is a separate, inline
     (non-forced) link so it plays instead of downloading."""
-    download_url = _dl_url(chat_id, message_id, file_unique_id, file_name, force_download=True)
-    token = encode_stream_token(chat_id, message_id)
-    secure_hash = (file_unique_id or "")[:6]
+    issued_at = int(time.time())
+    download_url = _dl_url(chat_id, message_id, file_name, force_download=True, issued_at=issued_at)
+    token = encode_stream_token(chat_id, message_id, issued_at)
+    sig = _compute_signature(chat_id, message_id, issued_at)
     base = URL if URL.endswith("/") else URL + "/"
-    watch_url = f"{base}watch/{token}?hash={secure_hash}"
+    watch_url = f"{base}watch/{token}?hash={sig}"
     return download_url, watch_url
 
 
@@ -234,12 +268,12 @@ def get_streamer() -> ByteStreamer:
     return _streamer
 
 
-async def stream_media(request: web.Request, chat_id: int, message_id: int, secure_hash: str) -> web.Response:
+async def stream_media(request: web.Request, chat_id: int, message_id: int) -> web.Response:
+    # NOTE: the link's signature + expiry must already be verified by the
+    # caller (via resolve_stream_token) before this is ever called - no
+    # authorization check happens here, only the actual byte streaming.
     streamer = get_streamer()
     file_id = await streamer.get_file_properties(chat_id, message_id)
-
-    if file_id.unique_id[:6] != secure_hash:
-        raise InvalidStreamHash
 
     file_size = file_id.file_size
     range_header = request.headers.get("Range")
@@ -354,17 +388,21 @@ _WATCH_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
-async def render_watch_page(chat_id: int, message_id: int, secure_hash: str) -> str:
+async def render_watch_page(chat_id: int, message_id: int) -> str:
+    # NOTE: the link's signature + expiry must already be verified by the
+    # caller (via resolve_stream_token) before this is ever called.
     streamer = get_streamer()
     file_id = await streamer.get_file_properties(chat_id, message_id)
 
-    if file_id.unique_id[:6] != secure_hash:
-        raise InvalidStreamHash
-
-    download_url, watch_url = build_stream_urls(chat_id, message_id, file_id.unique_id, file_id.file_name)
-    inline_url = _dl_url(chat_id, message_id, file_id.unique_id, file_id.file_name, force_download=False)
+    issued_at = int(time.time())
+    download_url = _dl_url(chat_id, message_id, file_id.file_name, force_download=True, issued_at=issued_at)
+    inline_url = _dl_url(chat_id, message_id, file_id.file_name, force_download=False, issued_at=issued_at)
     mime_type = file_id.mime_type or ""
-    file_name = (file_id.file_name or "file").replace("_", " ")
+    # html.escape: file_name comes straight from the uploaded file's own
+    # filename, which an attacker-controlled upload (public mode) could set
+    # to something like '<img src=x onerror=...>' - never trust it unescaped
+    # in HTML output.
+    file_name = html.escape((file_id.file_name or "file").replace("_", " "))
     file_size = humanbytes(file_id.file_size)
 
     if mime_type.startswith("audio"):
