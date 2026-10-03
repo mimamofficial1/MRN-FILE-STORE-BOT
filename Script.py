@@ -1,7 +1,7 @@
 
 
 class script(object):
-    START_TXT = """Hey {} !! 💌
+    START_TXT = """<b>Hey {} !! 💌
 
 Welcome To Mrn Officialx File Store Bot! ✨❤️
 
@@ -10,7 +10,8 @@ Welcome To Mrn Officialx File Store Bot! ✨❤️
 🤵 Powered By @Mrn_Officialx
 
 💬 Need Help, Have A Request, Query, Or Feedback? We're Here To Help.
-🤵 Contact >>> @Mrn_Contact_Bot"""
+
+🤵 Contact >>> @Mrn_Contact_Bot</b>"""
 
 
     
