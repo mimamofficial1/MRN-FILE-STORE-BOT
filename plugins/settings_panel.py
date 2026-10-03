@@ -17,11 +17,11 @@ def main_menu_text(settings):
     last_used = readable_ago(settings.get("last_used"))
     last_used_line = f"{last_used}" if last_used == "Never" else f"{last_used} Ago"
     return (
-        "⚙️ <u><b>Mrn Manage Bot • Settings</b></u>\n\n"
-        "🤖 <u>Welcome To The Mrn Bot Control Panel</u>\n\n"
-        "🛠 <u>Manage Your Bot Features, Preferences &amp; Controls From One Place.</u>\n\n"
-        f"🕐 <u>Last Used: {last_used_line}</u>\n\n"
-        "👇 <u>Choose A Setting To Continue</u>"
+        "<u><b><blockquote>⚙️ ᴍʀɴ ᴍᴀɴᴀɢᴇ ʙᴏᴛ • ꜱᴇᴛᴛɪɴɢꜱ\n\n"
+        "🤖 ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ᴛʜᴇ ᴍʀɴ ʙᴏᴛ ᴄᴏɴᴛʀᴏʟ ᴘᴀɴᴇʟ\n\n"
+        "🛠️ ᴍᴀɴᴀɢᴇ ʏᴏᴜʀ ʙᴏᴛ ғᴇᴀᴛᴜʀᴇs, ᴘʀᴇғᴇʀᴇɴᴄᴇs & ᴄᴏɴᴛʀᴏʟs ғʀᴏᴍ ᴏɴᴇ ᴘʟᴀᴄᴇ.\n\n"
+        f"🕐 ʟᴀꜱᴛ ᴜꜱᴇᴅ: {last_used_line}\n\n"
+        "👇 ᴄʜᴏᴏꜱᴇ ᴀ ꜱᴇᴛᴛɪɴɢ ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ</b></blockquote></u>"
     )
 
 
