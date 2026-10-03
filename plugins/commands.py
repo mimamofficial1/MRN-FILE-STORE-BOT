@@ -234,7 +234,7 @@ def _markup(rows):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False):
+async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer=None):
     """Copy `src` to `chat_id`. If the fancy version (caption + buttons) is
     rejected by Telegram, retry with less and less until the user at least
     gets the file. Returns (sent_message, first_error_or_None)."""
@@ -250,9 +250,16 @@ async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False):
         kw = {k: v for k, v in kw.items() if not (k == "caption" and v is None)}
         for _ in range(2):  # 2nd pass only used after a FloodWait
             try:
+                t0 = time.monotonic()
                 sent = await src.copy(chat_id=chat_id, **kw)
+                if pacer is not None and time.monotonic() - t0 > 1.5:
+                    # Pyrogram silently sleeps through short FloodWaits, so a slow
+                    # copy = Telegram is throttling us -> slow the batch pace down
+                    pacer["delay"] = min(pacer["delay"] * 2, 1.0)
                 return sent, first_error
             except FloodWait as e:
+                if pacer is not None:
+                    pacer["delay"] = min(pacer["delay"] * 2, 1.0)
                 await asyncio.sleep(e.value)
                 continue
             except Exception as e:
@@ -447,6 +454,7 @@ async def start(client, message):
                     if r:
                         fetched[(ch, r.id)] = r
 
+        pacer = {"delay": 0.25}  # starts fast; doubles (max 1s) whenever Telegram throttles
         for channel_id, msgid in order:
             info = fetched.get((channel_id, msgid))
             if not info:
@@ -472,7 +480,7 @@ async def start(client, message):
                 button.extend(stream_download_buttons(channel_id, msgid, file))
                 protect = settings.get("protect_content", False)
                 try:
-                    msg, _err = await _safe_copy(info, message.from_user.id, caption=f_caption, rows=button, protect=protect)
+                    msg, _err = await _safe_copy(info, message.from_user.id, caption=f_caption, rows=button, protect=protect, pacer=pacer)
                 except Exception:
                     continue
             else:
@@ -481,13 +489,13 @@ async def start(client, message):
                 protect = settings.get("protect_content", False)
                 button = _build_custom_buttons(settings)
                 try:
-                    msg, _err = await _safe_copy(info, message.from_user.id, rows=button, protect=protect)
+                    msg, _err = await _safe_copy(info, message.from_user.id, rows=button, protect=protect, pacer=pacer)
                 except Exception:
                     continue
             filesarr.append(msg)
             titles.append(title)
             accessed_refs.append((channel_id, msgid))
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(pacer["delay"])
         try:
             if titles:
                 shown = titles[:30]
