@@ -1,16 +1,16 @@
 
 
 class script(object):
-    START_TXT = """<b>ʜᴇʟʟᴏ {}, ᴍʏ ɴᴀᴍᴇ {} 👋,
+    START_TXT = """Hey 🎵🦋{}🎵❤️ !! 💌
 
-ɪ ᴀᴍ ʟᴀᴛᴇꜱᴛ ᴀᴅᴠᴀɴᴄᴇᴅ ᴀɴᴅ ᴘᴏᴡᴇʀꜰᴜʟ ꜰɪʟᴇ ꜱᴛᴏʀᴇ ʙᴏᴛ
+Welcome To Mrn Officialx File Store Bot! ✨❤️
 
-ɪ ᴄᴀɴ ꜱᴛᴏʀᴇ ꜰɪʟᴇꜱ ꜱᴀꜰᴇʟʏ, ᴀɴᴅ ᴜꜱᴇʀꜱ ᴄᴀɴ ᴀᴄᴄᴇꜱꜱ ᴛʜᴇᴍ ᴛʜʀᴏᴜɢʜ ᴛʜᴇ ᴘʀᴏᴠɪᴅᴇᴅ ꜱʜᴀʀᴇ ʟɪɴᴋ.
+📂 Access Your Content Easily Through The Links Provided. ⚡
 
-👨‍💻 ᴘᴏᴡᴇʀᴇᴅ ʙʏ: @Mrn_Officialx
+🤵 Powered By @Mrn_Officialx
 
-✅ ᴀɴʏ ʀᴇǫᴜᴇꜱᴛ / ǫᴜᴇʀʏ / ꜰᴇᴇᴅʙᴀᴄᴋ / ᴘᴀɪᴅ / ᴅᴇᴍᴏ
-🧑‍🔧 ᴄᴏɴᴛᴀᴄᴛ >>> @Mimam_Officialx</b>"""
+💬 Need Help, Have A Request, Query, Or Feedback? We're Here To Help.
+🤵 Contact >>> @Mimam_Officialx"""
 
 
     

@@ -1,3 +1,5 @@
+
+
 import re
 import os
 from os import environ
@@ -13,7 +15,7 @@ def is_enabled(value, default):
         return default
       
 # Bot Information
-API_ID = int(environ.get("API_ID", ""))
+API_ID = int(environ.get("API_ID", "23631217"))
 API_HASH = environ.get("API_HASH", "")  # set this in your host's environment variables
 BOT_TOKEN = environ.get("BOT_TOKEN", "")
 
@@ -48,7 +50,7 @@ VERIFY_MODE = is_enabled(environ.get('VERIFY_MODE', "False"), False) # Set True 
 
 # If Verify Mode Is True Then Fill All Required Variable, If False Then Don't Fill.
 SHORTLINK_URL = environ.get("SHORTLINK_URL", "linkshortify.com") # shortlink domain without https://
-SHORTLINK_API = environ.get("SHORTLINK_API", "933f3923527586776d9c6c6c6eebd1a30563bee6") # shortlink api (set in environment variables)
+SHORTLINK_API = environ.get("SHORTLINK_API", "") # shortlink api (set in environment variables)
 VERIFY_TUTORIAL = environ.get("VERIFY_TUTORIAL", "https://t.me/MRN_Tutorial/1806") # how to open link 
 
 # Website Info:
@@ -60,10 +62,12 @@ WEBSITE_URL = environ.get("WEBSITE_URL", "https://mrn-universe-store-tv.blogspot
 # Fast Download / Watch Online Info:
 STREAM_MODE = is_enabled(environ.get('STREAM_MODE', "True"), True) # Set True or False
 # Uses the URL variable below as the public base URL for stream/download links.
+STREAM_LINK_TTL = int(environ.get("STREAM_LINK_TTL", "86400"))  # seconds a stream/download link stays valid (default 24h); 0 = never expire
 
 PING_INTERVAL = int(environ.get("PING_INTERVAL", "1200"))  # 20 minutes
 if 'DYNO' in environ:
     ON_HEROKU = True
 else:
     ON_HEROKU = False
-URL = environ.get("URL", "https://mrn-store-tv-production.up.railway.app/")
+URL = environ.get("URL", "https://mrn-universe-store-tv.koyeb.app/")
+

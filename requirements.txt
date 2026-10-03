@@ -1,9 +1,9 @@
 pyrofork==2.3.45
-Tgcrypto
-aiohttp
+TgCrypto==1.2.5
+aiohttp==3.14.3
 pymongo[srv]==3.12.3
 motor==2.5.1
-validators
-psutil
-pytz
-shortzy
+validators==0.35.0
+psutil==7.2.2
+pytz==2026.3.post1
+shortzy==0.0.8
