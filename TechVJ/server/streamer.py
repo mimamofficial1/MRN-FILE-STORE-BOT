@@ -31,6 +31,7 @@ import html
 import logging
 import math
 import mimetypes
+import re
 import time
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
@@ -321,71 +322,516 @@ async def stream_media(request: web.Request, chat_id: int, message_id: int) -> w
     )
 
 
-_WATCH_PAGE = """<!DOCTYPE html>
+_WATCH_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>{file_name} | Mrn Officialx</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<meta name="color-scheme" content="dark light">
+
+<title>__FILE_NAME__ | MRN Officialx</title>
+
+<link rel="icon" href="https://files.catbox.moe/idl5a5.png" type="image/jpeg">
+
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
 <style>
-  :root {{
-    --bg: #05070d; --panel: rgba(20,24,38,.75); --border: rgba(255,255,255,.08);
-    --text: #f4f6fb; --muted: #98a2b8; --gold: #f5c453; --rose: #f43f5e;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; min-height: 100vh; font-family: 'Segoe UI', Roboto, Arial, sans-serif;
-    background: radial-gradient(circle at top, #131a2c, var(--bg) 65%);
-    color: var(--text); display: flex; flex-direction: column; align-items: center;
-    padding: 24px 14px 48px;
-  }}
-  .brand {{
-    font-weight: 800; letter-spacing: .5px; margin-bottom: 18px; font-size: 1.15rem;
-    background: linear-gradient(120deg, var(--gold), var(--rose));
-    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
-  }}
-  .card {{
-    width: 100%; max-width: 780px; background: var(--panel); border: 1px solid var(--border);
-    border-radius: 16px; overflow: hidden; backdrop-filter: blur(10px);
-  }}
-  video, audio {{ width: 100%; display: block; background: #000; }}
-  audio {{ padding: 28px 16px; }}
-  .info {{ padding: 18px 20px 6px; }}
-  .title {{ font-size: 1.02rem; font-weight: 600; word-break: break-word; }}
-  .meta {{ margin-top: 4px; color: var(--muted); font-size: .85rem; }}
-  .actions {{ display: flex; flex-wrap: wrap; gap: 10px; padding: 16px 20px 22px; }}
-  .btn {{
-    flex: 1 1 150px; text-align: center; text-decoration: none; padding: 12px 14px;
-    border-radius: 10px; font-weight: 600; font-size: .9rem; border: 1px solid var(--border);
-    color: var(--text); background: rgba(255,255,255,.04); transition: transform .15s ease;
-  }}
-  .btn:active {{ transform: scale(.97); }}
-  .btn.primary {{ background: linear-gradient(120deg, var(--gold), var(--rose)); color: #10131d; border: none; }}
-  .players {{ padding: 0 20px 26px; color: var(--muted); font-size: .82rem; }}
-  .players a {{ color: var(--gold); text-decoration: none; margin-right: 12px; }}
-</style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --gold: #7c3aed;
+    --gold-light: #a78bfa;
+    --pink: #06b6d4;
+    --dark: #14101f;
+    --card-bg: #f5f0ff;
+    --text: #14101f;
+    --muted: #6b6178;
+    --cream: #faf8ff;
+  }
+
+  body {
+    font-family: 'Poppins', sans-serif;
+    background: var(--bg);
+    overflow-x: hidden;
+    color: var(--text);
+    min-height: 100vh;
+    transition: background 0.3s ease, color 0.3s ease;
+  }
+
+  /* ── HEADER ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.07);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo-wrap { display: flex; align-items: center; gap: 10px; }
+  .logo-icon { width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 24px; text-decoration: none; overflow: hidden; }
+
+  .icon-row { width: 110px; height: 110px; border-radius: 50%; object-fit: cover; margin-bottom: 25px; animation: floatLogo 4s ease-in-out infinite; }
+
+  .logo-icon img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+  .icon-row img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+
+  .logo-text {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 26px;
+    letter-spacing: 2px;
+    background: linear-gradient(90deg, var(--gold), var(--pink));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-decoration: none;
+  }
+
+  .header-center {
+    font-family: 'Poppins', sans-serif;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #fff;
+    padding: 10px 22px;
+    background: linear-gradient(90deg, #7c3aed, #06b6d4);
+    border-radius: 50px;
+  }
+
+  .join-btn-header {
+    background: linear-gradient(135deg, var(--gold), #5b21b6);
+    color: #fff;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 50px;
+    font-family: 'Poppins', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    text-decoration: none;
+    box-shadow: 0 2px 5px rgba(124, 58, 237, 0.35);
+    transition: all .3s ease;
+  }
+  .join-btn-header:hover { transform: translateY(-2px); box-shadow: 0 5px 10px rgba(6, 182, 212, 0.45); }
+
+  /* ── HERO ── */
+  .hero { text-align: center; padding: 90px 5% 60px; max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; align-items: center; }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 1.5px solid var(--gold);
+    color: var(--gold);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 16px;
+    border-radius: 50px;
+    margin-bottom: 20px;
+    letter-spacing: 0.5px;
+  }
+
+  .badge-dot { width: 7px; height: 7px; background: var(--gold); border-radius: 50%; animation: pulse 1.8s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.7); } }
+
+  .hero-title { font-family: 'Bebas Neue', sans-serif; font-size: clamp(50px, 7vw, 78px); letter-spacing: 2px; line-height: 1.2; color: var(--text); margin-bottom: 15px; }
+
+  .hero-subtitle {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: clamp(50px, 7vw, 78px);
+    letter-spacing: 2px;
+    background: linear-gradient(90deg, #7c3aed, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 30px;
+    line-height: 0.8;
+  }
+
+  .hero-desc { font-size: 18px; color: var(--muted); line-height: 1.7; max-width: 650px; margin: 0 auto 40px; }
+
+  .join-btn-hero {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: linear-gradient(135deg, var(--gold), #5b21b6); color: #fff; text-decoration: none;
+    font-weight: 700; font-size: 16px; padding: 15px 36px; border-radius: 50px;
+    box-shadow: 0 6px 20px rgba(124, 58, 237, 0.35); transition: all .3s ease;
+  }
+  .join-btn-hero:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(6, 182, 212, 0.45); }
+
+  /* ── STATS ── */
+  .stats-strip { display: flex; justify-content: center; gap: 0; flex-wrap: wrap; max-width: 700px; margin: 10px auto 20px; padding: 0 6%; }
+  .stat { flex: 1; min-width: 140px; text-align: center; padding: 16px 12px; border-left: 1px solid var(--border); }
+  .stat:first-child { border-left: none; }
+  .stat-num { font-family: 'Bebas Neue', sans-serif; font-size: 28px; letter-spacing: 1px; background: linear-gradient(90deg, var(--gold), var(--pink)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+  .stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* ── GENRE TAGS ── */
+  .genres { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; padding: 22px 20px 10px; }
+  .genre-tag { background: var(--surface); border: 1.5px solid var(--gold); color: var(--gold); font-size: 13px; font-weight: 600; padding: 7px 18px; border-radius: 50px; transition: all .3s ease; }
+  .genre-tag:hover { transform: scale(1.05); }
+
+  /* ── ABOUT ── */
+  .section-label { text-align: center; margin: 60px 0 20px; }
+  .section-label span {
+    display: inline-flex; background: transparent; border: 1px solid var(--gold); color: var(--gold);
+    font-size: 12px; letter-spacing: 2px; font-weight: 600; padding: 8px 20px; border-radius: 50px;
+    text-transform: uppercase; gap: 8px;
+  }
+
+  .about { padding: 0 20px 60px; max-width: 900px; margin: 0 auto; text-align: center; }
+  .about h2 { font-family: 'Bebas Neue', sans-serif; font-size: 36px; font-weight: 700; letter-spacing: 1.5px; color: var(--text); margin-bottom: 12px; text-align: center; }
+  .about p { font-size: 16px; color: var(--muted); line-height: 1.7; max-width: 650px; text-align: center; margin: 0 auto; }
+
+  /* ── PLAN CARDS — side by side, not stacked ── */
+  .plans { padding: 8px 16px 40px; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; max-width: 740px; margin: 0 auto; }
+
+  .plan-card {
+    background: var(--surface); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-radius: 18px; padding: 24px 20px; border: 1px solid var(--border);
+    box-shadow: 0 4px 18px rgba(124,58,237,.08); transition: all .35s ease; position: relative; overflow: hidden;
+  }
+  .plan-card:hover { border-color: var(--accent); transform: translateY(-6px); box-shadow: 0 10px 30px rgba(124,58,237,0.2); }
+  .plan-card:hover .plan-icon { transform: scale(1.08); box-shadow: 0 0 25px rgba(124,58,237,.35), 0 0 60px rgba(124,58,237,.15); }
+
+  .plan-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+
+  .plan-icon {
+    width: 68px; height: 68px; border-radius: 22px; display: flex; align-items: center; justify-content: center;
+    font-size: 28px; border: 1px solid rgba(124,58,237,.18);
+    box-shadow: 0 0 25px rgba(124,58,237,.18), inset 0 0 15px rgba(124,58,237,.35);
+    transition: all .4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  }
+  .plan-card:hover .plan-icon { background: linear-gradient(135deg, #7c3aed, #06b6d4); transform: rotate(-8deg) scale(1.08); }
+  .plan-icon.free-icon { background: rgba(6,182,212,.15); border: 1px solid rgba(6,182,212,.25); }
+  .plan-icon.prem-icon { background: rgba(124,58,237,.15); border: 1px solid rgba(124,58,237,.25); }
+
+  .plan-title { font-weight: 700; font-size: 16px; color: var(--text); }
+  .plan-tag { font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 50px; margin-top: 2px; display: inline-block; color: #fff; }
+  .plan-tag.free-tag { background: rgba(6,182,212,.15); color: var(--pink); }
+  .plan-tag.prem-tag { background: linear-gradient(90deg, var(--gold), var(--pink)); color: #fff; }
+
+  .plan-features { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  .plan-features li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: var(--muted); line-height: 1.45; }
+  .plan-features li::before { content: '✓'; color: var(--gold); font-weight: 700; margin-top: 1px; flex-shrink: 0; }
+
+  /* ── CTA BOTTOM ── */
+  .cta-bottom { padding: 32px 20px 48px; text-align: center; background: transparent; }
+  .cta-bottom h3 { font-family: 'Bebas Neue', sans-serif; font-size: 28px; letter-spacing: 1.5px; margin-bottom: 8px; color: var(--text); }
+  .cta-bottom p { font-size: 13px; color: var(--muted); margin-bottom: 22px; }
+  .join-btn-bottom {
+    display: inline-flex; align-items: center; gap: 8px; background: linear-gradient(135deg, var(--gold), #5b21b6);
+    color: #fff; text-decoration: none; font-weight: 700; font-size: 16px; padding: 15px 36px; border-radius: 50px;
+    box-shadow: 0 3px 8px rgba(124,58,237,0.35); transition: all .3s ease;
+  }
+  .join-btn-bottom:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(6,182,212,0.45); }
+
+  /* ── FOOTER ── */
+  footer { text-align: center; padding: 25px 20px; font-size: 15px; color: var(--muted); background: var(--surface); border-top: 1px solid var(--border); }
+
+  @media (max-width: 768px) { footer { padding: 18px 15px; font-size: 13px; } }
+
+  @keyframes floatLogo { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+
+  .fade-page { animation: pageFade .7s ease; }
+  @keyframes pageFade { from { opacity:0; transform:translateY(15px); } to { opacity:1; transform:translateY(0); } }
+
+  #particles-js { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
+  .reveal { opacity: 0; transform: translateY(30px); transition: all 0.8s ease; }
+  .reveal.active { opacity: 1; transform: translateY(0); }
+
+  .header-center { display: block; color: #fff; }
+  @media (max-width: 768px) { .header-center { display: none; } }
+
+  :root {
+    --bg: #f7f5fb;
+    --surface: #ffffff;
+    --text: #14101f;
+    --border: #e9e3f5;
+    --accent: #7c3aed;
+    --muted: #6b6178;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0714;
+      --surface: #150e22;
+      --text: #ffffff;
+      --border: rgba(255,255,255,0.08);
+      --accent: #a78bfa;
+      --muted: #b5aec2;
+    }
+  }
+
+
+  /* ── WATCH / PLAYER ── */
+  .watch-wrap { display: flex; flex-direction: column; align-items: center; padding: 34px 16px 6px; }
+  .player-card {
+    width: 100%; max-width: 860px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 18px; overflow: hidden; box-shadow: 0 8px 30px rgba(124,58,237,.18);
+  }
+  .player-card video, .player-card audio { width: 100%; display: block; background: #000; }
+  .player-card video { max-height: 72vh; }
+  .player-card audio { padding: 26px 16px; background: transparent; }
+  .player-info { padding: 18px 22px 4px; }
+  .player-title { font-weight: 700; font-size: 16px; line-height: 1.45; color: var(--text); word-break: break-word; }
+  .player-meta { margin-top: 4px; font-size: 13px; color: var(--muted); }
+  .player-actions { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 22px 8px; }
+  .player-actions a { flex: 1 1 190px; justify-content: center; text-align: center; }
+  .join-btn-hero.dl-btn { padding: 13px 22px; font-size: 15px; }
+  .alt-btn {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none; font-weight: 700; font-size: 15px;
+    padding: 13px 22px; border-radius: 50px; color: var(--accent); background: var(--surface);
+    border: 1.5px solid var(--accent); transition: all .3s ease;
+  }
+  .alt-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(6,182,212,.35); }
+  .ext-players { padding: 8px 22px 20px; font-size: 13px; color: var(--muted); }
+  .ext-players a { color: var(--accent); font-weight: 600; text-decoration: none; margin-left: 12px; }
+  .ext-players a:hover { text-decoration: underline; }
+  </style>
 </head>
-<body>
-  <div class="brand">⚡ Mrn Officialx</div>
-  <div class="card">
-    {media_tag}
-    <div class="info">
-      <div class="title">{file_name}</div>
-      <div class="meta">{file_size}</div>
+<body class="fade-page">
+
+<canvas id="particles-js"></canvas>
+
+<!-- HEADER -->
+<header>
+    <div class="logo-wrap">
+        <a class="logo-icon" href="https://t.me/Mrn_Officialx" target="_blank">
+            <img src="https://files.catbox.moe/idl5a5.png" alt="MRN Officialx Logo">
+        </a>
+        <a class="logo-text" href="https://t.me/Mrn_Officialx" target="_blank">MRN OFFICIALX</a>
     </div>
-    <div class="actions">
-      <a class="btn primary" href="{download_url}">🚀 Fast Download</a>
-      <a class="btn" href="{inline_url}" target="_blank" rel="noopener">🔗 Direct Stream Link</a>
+
+    <div class="header-center">NEW RELEASES EVERY DAY</div>
+
+    <a class="join-btn-header" href="https://t.me/+MdUPwSnwvP0zN2U1" target="_blank">
+        𝐑𝐄𝐀𝐋𝐈𝐓𝐘 𝐒𝐇𝐎𝐖𝐒
+    </a>
+</header>
+
+<!-- PLAYER -->
+<section class="watch-wrap">
+  <div class="badge"><span class="badge-dot"></span>▶ Now Watching · __KIND__</div>
+  <div class="player-card">
+    __MEDIA_TAG__
+    <div class="player-info">
+      <div class="player-title">__FILE_NAME__</div>
+      <div class="player-meta">__FILE_SIZE__</div>
     </div>
-    <div class="players">
+    <div class="player-actions">
+      <a class="join-btn-hero dl-btn" href="__DOWNLOAD_URL__">🚀 Fast Download</a>
+      <a class="alt-btn" href="__INLINE_URL__" target="_blank" rel="noopener">🔗 Direct Stream Link</a>
+    </div>
+    <div class="ext-players">
       Open externally:
-      <a href="intent:{inline_url}#Intent;action=android.intent.action.VIEW;type=video/*;package=com.mxtech.videoplayer.ad;end">MX Player</a>
-      <a href="intent:{inline_url}#Intent;action=android.intent.action.VIEW;type=video/*;package=org.videolan.vlc;end">VLC</a>
-      <a href="playit://playerv2/video?url={inline_url}">PLAYit</a>
+      <a href="intent:__INLINE_URL__#Intent;action=android.intent.action.VIEW;type=video/*;package=com.mxtech.videoplayer.ad;end">MX Player</a>
+      <a href="intent:__INLINE_URL__#Intent;action=android.intent.action.VIEW;type=video/*;package=org.videolan.vlc;end">VLC</a>
+      <a href="playit://playerv2/video?url=__INLINE_URL__">PLAYit</a>
     </div>
   </div>
+</section>
+
+<!-- HERO -->
+<section class="hero reveal">
+    <a class="icon-row" href="https://t.me/Mrn_Officialx" target="_blank">
+        <img src="https://files.catbox.moe/idl5a5.png" alt="MRN Officialx Logo">
+    </a>
+
+    <div class="badge">
+        <span class="badge-dot"></span>
+        ⭐ Free &amp; Premium Entertainment Service
+    </div>
+
+    <div class="hero-title">Unlimited Entertainment</div>
+    <div class="hero-subtitle">MRN Officialx</div>
+
+    <p class="hero-desc">
+        Access the latest Movies, Web Series, and TV Shows through our community.
+        Users can access content for free through shortened links, while Premium members get direct access to videos through our Premium Channel.
+    </p>
+
+    <a class="join-btn-hero" href="https://t.me/MRN_Movies_Request_Group" target="_blank">
+        𝐌𝐑𝐍 | 𝐌𝐎𝐕𝐈𝐄𝐒 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 𝐆𝐑𝐎𝐔𝐏 →
+    </a>
+</section>
+
+<!-- STATS -->
+<div class="stats-strip reveal">
+    <div class="stat"><div class="stat-num">1000+</div><div class="stat-label">Titles Available</div></div>
+    <div class="stat"><div class="stat-num">24/7</div><div class="stat-label">Bot Active</div></div>
+    <div class="stat"><div class="stat-num">Daily</div><div class="stat-label">New Uploads</div></div>
+</div>
+
+<!-- GENRE TAGS -->
+<div class="genres">
+  <span class="genre-tag">🎬 Movies</span>
+  <span class="genre-tag">📺 Web Series</span>
+  <span class="genre-tag">📡 TV Shows</span>
+</div>
+
+<!-- ABOUT LABEL -->
+<div class="section-label"><span>About</span></div>
+
+<!-- ABOUT -->
+<section class="about reveal">
+  <h2>About MRN Officialx</h2>
+  <p>
+    MRN Officialx provides Movies, Web Series, and TV Shows through both Free and Premium methods.
+    Users can access content for free through shortened links, while
+    Premium members receive direct videos through our Premium Channel. New content is added regularly
+    to keep the collection updated.
+  </p>
+</section>
+
+<!-- PLAN CARDS -->
+<div class="section-label"><span>How It Works</span></div>
+<div class="plans reveal">
+  <div class="plan-card free">
+    <div class="plan-header">
+      <div class="plan-icon free-icon">🔗</div>
+      <div>
+        <div class="plan-title">Free Access</div>
+        <span class="plan-tag free-tag">Always Free</span>
+      </div>
+    </div>
+    <ul class="plan-features">
+      <li>Get Content Through Shortened Links</li>
+      <li>No Payment Required</li>
+      <li>Files Delivered Through Our File Storage Bot</li>
+      <li>Regular Content Updates</li>
+    </ul>
+  </div>
+
+  <div class="plan-card premium">
+    <div class="plan-header">
+      <div class="plan-icon prem-icon">👑</div>
+      <div>
+        <div class="plan-title">Premium Access</div>
+        <span class="plan-tag prem-tag">⭐ Premium</span>
+      </div>
+    </div>
+    <ul class="plan-features">
+      <li>Direct Videos Through Our Premium Channel</li>
+      <li>No Shortened Links</li>
+      <li>Choose Your Preferred Subscription Duration</li>
+      <li>Instant Access After Subscription</li>
+    </ul>
+  </div>
+</div>
+
+<!-- BOTTOM CTA -->
+<div class="cta-bottom">
+  <h3>Ready to Start Watching?</h3>
+  <p>Join MRN Officialx and enjoy Movies, Web Series and TV Shows through Free and Premium access options.</p>
+  <a class="join-btn-bottom" href="https://t.me/Mrn_Officialx" target="_blank">
+    ✈️ Join Channel →
+  </a>
+</div>
+
+<!-- FOOTER -->
+<footer>
+  © 2026 MRN Officialx &nbsp;•&nbsp; 🎬 Movies &nbsp;•&nbsp; 📺 Web Series &nbsp;•&nbsp; 📡 TV Shows
+</footer>
+
+<script>
+const canvas = document.getElementById("particles-js");
+const ctx = canvas.getContext("2d");
+
+let w, h;
+let particles = [];
+
+function resize(){
+  w = canvas.width = window.innerWidth;
+  h = canvas.height = window.innerHeight;
+}
+
+class Particle{
+  constructor(){
+    this.x = Math.random()*w;
+    this.y = Math.random()*h;
+    this.size = Math.random()*2 + 0.5;
+    this.speedX = (Math.random()-0.5)*0.5;
+    this.speedY = (Math.random()-0.5)*0.5;
+    this.hueMix = Math.random();
+  }
+  update(){
+    this.x += this.speedX;
+    this.y += this.speedY;
+
+    if(this.x<0 || this.x>w) this.speedX *= -1;
+    if(this.y<0 || this.y>h) this.speedY *= -1;
+  }
+  draw(){
+    const r = Math.round(124 + (6 - 124) * this.hueMix);
+    const g = Math.round(58 + (182 - 58) * this.hueMix);
+    const b = Math.round(237 + (212 - 237) * this.hueMix);
+    ctx.fillStyle = `rgba(${r},${g},${b},0.3)`;
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,this.size,0,Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function init(){
+  particles = [];
+  for(let i=0;i<80;i++){
+    particles.push(new Particle());
+  }
+}
+
+function animate(){
+  ctx.clearRect(0,0,w,h);
+  particles.forEach(p=>{
+    p.update();
+    p.draw();
+  });
+  requestAnimationFrame(animate);
+}
+
+window.addEventListener("resize", ()=>{
+  resize();
+  init();
+});
+
+resize();
+init();
+animate();
+
+
+// SCROLL REVEAL
+function reveal(){
+  let elements = document.querySelectorAll(".reveal");
+
+  elements.forEach(el=>{
+    let top = el.getBoundingClientRect().top;
+
+    if(top < window.innerHeight - 100){
+      el.classList.add("active");
+    }
+  });
+}
+
+window.addEventListener("scroll", reveal);
+reveal();
+</script>
+
 </body>
-</html>"""
+</html>
+"""
+
+
+_WATCH_TOKEN_RE = re.compile(r"__(FILE_NAME|FILE_SIZE|MEDIA_TAG|DOWNLOAD_URL|INLINE_URL|KIND)__")
 
 
 async def render_watch_page(chat_id: int, message_id: int) -> str:
@@ -401,16 +847,23 @@ async def render_watch_page(chat_id: int, message_id: int) -> str:
     # html.escape: file_name comes straight from the uploaded file's own
     # filename, which an attacker-controlled upload (public mode) could set
     # to something like '<img src=x onerror=...>' - never trust it unescaped
-    # in HTML output.
+    # in HTML output. URLs are escaped too (they sit inside attributes).
     file_name = html.escape((file_id.file_name or "file").replace("_", " "))
     file_size = humanbytes(file_id.file_size)
+    safe_inline = html.escape(inline_url, quote=True)
+    safe_download = html.escape(download_url, quote=True)
 
     if mime_type.startswith("audio"):
-        media_tag = f'<audio controls preload="metadata" src="{inline_url}"></audio>'
+        kind = "Audio"
+        media_tag = f'<audio controls preload="metadata" src="{safe_inline}"></audio>'
     else:
-        media_tag = f'<video controls playsinline preload="metadata" src="{inline_url}"></video>'
+        kind = "Video"
+        media_tag = f'<video controls playsinline preload="metadata" src="{safe_inline}"></video>'
 
-    return _WATCH_PAGE.format(
-        file_name=file_name, file_size=file_size, media_tag=media_tag,
-        download_url=download_url, inline_url=inline_url,
-    )
+    values = {
+        "FILE_NAME": file_name, "FILE_SIZE": file_size, "MEDIA_TAG": media_tag,
+        "DOWNLOAD_URL": safe_download, "INLINE_URL": safe_inline, "KIND": kind,
+    }
+    # single pass, so a file name that happens to contain a token like
+    # __INLINE_URL__ can never be substituted a second time
+    return _WATCH_TOKEN_RE.sub(lambda m: values[m.group(1)], _WATCH_PAGE)
