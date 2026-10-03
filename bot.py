@@ -53,6 +53,14 @@ async def start():
     bind_address = "0.0.0.0"
     await web.TCPSite(app, bind_address, PORT).start()
 
+    # Re-arm auto-deletes that were still pending when the bot last stopped
+    try:
+        from plugins.commands import restore_pending_deletes
+        restored = await restore_pending_deletes(StreamBot)
+        logging.info(f"Restored {restored} pending auto-delete(s)")
+    except Exception as e:
+        logging.error(f"Could not restore pending auto-deletes: {e}")
+
     tz = pytz.timezone('Asia/Kolkata')
     now = datetime.now(tz)
     today = now.date()  # IST date, not date.today()'s server/UTC date
