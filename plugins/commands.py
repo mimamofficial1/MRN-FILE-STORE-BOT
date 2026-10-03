@@ -378,13 +378,13 @@ async def start(client, message):
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
             k = await client.send_message(chat_id = message.from_user.id, text=(
-                f"🔔 <b>Just a Quick Reminder !!</b>\n\n"
+                f"🔔 <b><u>Just a Quick Reminder !!</u>\n\n"
                 f"⏳ This Content Will Be Automatically Deleted After <u>{del_minutes} Minutes</u> Due to Copyright Issues.\n\n"
                 f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
                 f"🤵 Powered By @Mrn_Officialx ⚡\n\n"
-                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mimam_Officialx"
+                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
             _spawn(_delete_batch_later(settings.get("auto_delete_time", 1800), filesarr, k))
         return
@@ -454,13 +454,13 @@ async def start(client, message):
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
             k = await client.send_message(chat_id = message.from_user.id, text=(
-                f"🔔 <b>Just a Quick Reminder !!</b>\n\n"
+                f"🔔 <b><u>Just a Quick Reminder !!</u>\n\n"
                 f"⏳ This Content Will Be Automatically Deleted After <u>{del_minutes} Minutes</u> Due to Copyright Issues.\n\n"
                 f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
                 f"🤵 Powered By @Mrn_Officialx ⚡\n\n"
-                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mimam_Officialx"
+                f"🤵 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
             _spawn(_delete_single_later(settings.get("auto_delete_time", 1800), del_msg, k))
         return
