@@ -69,5 +69,5 @@ if 'DYNO' in environ:
     ON_HEROKU = True
 else:
     ON_HEROKU = False
-URL = environ.get("URL", "https://mrn-store-tv-production.up.railway.app/")
+URL = environ.get("URL", "https://web-production-f6113.up.railway.app/")
 
