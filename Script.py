@@ -37,7 +37,7 @@ If You Want To Remove Api Then Copy This And Send To Bot - `/api None`"""
 
 📚 ʟɪʙʀᴀʀʏ: <a href=https://docs.pyrogram.org>Pyrogram</a>
 
-🇮🇳 ᴅᴇᴠᴇʟᴏᴘᴇʀ: <a href=https://t.me/mimam_officialx>Mimam</a>
+👨‍💻 ᴅᴇᴠᴇʟᴏᴘᴇʀ: <a href=https://t.me/mimam_officialx>Mimam</a>
 
 👥 sᴜᴘᴘᴏʀᴛ: <a href=https://t.me/MRN_CONTACT_BOT>Contact Bot</a>
 
