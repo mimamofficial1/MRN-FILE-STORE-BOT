@@ -175,11 +175,11 @@ async def start(client, message):
         Used for a plain /start, and as a safe fallback whenever a start
         parameter turns out to not be a real, decodable file link."""
         buttons = [[
-            InlineKeyboardButton('🤵 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
-            InlineKeyboardButton('📣 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
+            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
             ],[
-            InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
-            InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
+            InlineKeyboardButton('💁‍♂ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('💎 ᴀʙᴏᴜᴛ', callback_data='about')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
         me = client.me
@@ -548,11 +548,11 @@ async def cb_handler(client: Client, query: CallbackQuery):
     
     elif query.data == "start":
         buttons = [[
-            InlineKeyboardButton('🤵 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
-            InlineKeyboardButton('📣 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
+            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
             ],[
-            InlineKeyboardButton('💁‍♀️ ʜᴇʟᴘ', callback_data='help'),
-            InlineKeyboardButton('😊 ᴀʙᴏᴜᴛ', callback_data='about')
+            InlineKeyboardButton('💁‍♂ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('💎 ᴀʙᴏᴜᴛ', callback_data='about')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
         settings = await get_settings()
