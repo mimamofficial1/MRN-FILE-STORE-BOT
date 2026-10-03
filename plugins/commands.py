@@ -7,7 +7,8 @@ from Script import script
 from plugins.dbusers import db
 from pyrogram import Client, filters, enums
 from plugins.users_api import get_user, update_user_info
-from pyrogram.errors import ChatAdminRequired, FloodWait
+from pyrogram.errors import ChatAdminRequired, FloodWait, PeerIdInvalid, ChannelInvalid
+import html
 from pyrogram.types import *
 from utils import verify_user, check_token, check_verification, get_token
 from plugins.settings_db import get_settings
@@ -133,6 +134,81 @@ async def _delete_single_later(delay, del_msg, notice):
         pass
     try:
         await notice.edit_text("<b>Your File/Video is successfully deleted!!!</b>")
+    except Exception:
+        pass
+
+
+def _build_custom_buttons(settings):
+    """Rows of valid custom buttons from /settings. Anything with an empty text
+    or a non-link url is skipped - ONE bad button used to make Telegram reject
+    every single delivery (BUTTON_URL_INVALID) -> 'file could not be found'."""
+    rows = []
+    for row in (settings.get("custom_buttons") or []):
+        btns = []
+        for b in row:
+            try:
+                text = (b.get("text") or "").strip()
+                url = (b.get("url") or "").strip()
+            except AttributeError:
+                continue
+            if text and url.startswith(("http://", "https://", "tg://")):
+                btns.append(InlineKeyboardButton(text, url=url))
+        if btns:
+            rows.append(btns)
+    return rows
+
+
+def _markup(rows):
+    # never send an empty InlineKeyboardMarkup([]) - use no markup at all
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False):
+    """Copy `src` to `chat_id`. If the fancy version (caption + buttons) is
+    rejected by Telegram, retry with less and less until the user at least
+    gets the file. Returns (sent_message, first_error_or_None)."""
+    attempts = [
+        {"caption": caption, "reply_markup": _markup(rows), "protect_content": protect},
+        {"caption": caption, "protect_content": protect},
+        {"protect_content": protect},
+        {},
+    ]
+    first_error = None
+    last_error = None
+    for kw in attempts:
+        kw = {k: v for k, v in kw.items() if not (k == "caption" and v is None)}
+        for _ in range(2):  # 2nd pass only used after a FloodWait
+            try:
+                sent = await src.copy(chat_id=chat_id, **kw)
+                return sent, first_error
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                continue
+            except Exception as e:
+                last_error = e
+                if first_error is None:
+                    first_error = e
+                break
+    raise last_error
+
+
+async def _get_log_message(client, mid):
+    """Fetch a stored message from LOG_CHANNEL. Re-resolves the channel if the
+    bot's peer cache is empty (happens after a redeploy) and fails loudly if
+    the message is gone, instead of returning an empty Message."""
+    try:
+        msg = await client.get_messages(LOG_CHANNEL, mid)
+    except (PeerIdInvalid, ChannelInvalid):
+        await client.get_chat(LOG_CHANNEL)
+        msg = await client.get_messages(LOG_CHANNEL, mid)
+    if not msg or msg.empty:
+        raise ValueError(f"Message {mid} not found in LOG_CHANNEL (deleted, or wrong LOG_CHANNEL)")
+    return msg
+
+
+async def _log_warning(client, text):
+    try:
+        await client.send_message(LOG_CHANNEL, text)
     except Exception:
         pass
 
@@ -321,32 +397,21 @@ async def start(client, message):
                         f_caption=f_caption
                 if f_caption is None:
                     f_caption = f"{title}"
-                button = []
-                for row in (settings.get("custom_buttons") or []):
-                    button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
+                button = _build_custom_buttons(settings)
                 button.extend(stream_download_buttons(channel_id, msgid, file))
-                reply_markup = InlineKeyboardMarkup(button)
                 protect = settings.get("protect_content", False)
                 try:
-                    msg = await info.copy(chat_id=message.from_user.id, caption=f_caption, protect_content=protect, reply_markup=reply_markup)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    msg = await info.copy(chat_id=message.from_user.id, caption=f_caption, protect_content=protect, reply_markup=reply_markup)
-                except:
+                    msg, _err = await _safe_copy(info, message.from_user.id, caption=f_caption, rows=button, protect=protect)
+                except Exception:
                     continue
             else:
                 title = "Unknown File"
+                title = "Unknown File"
                 protect = settings.get("protect_content", False)
-                button = []
-                for row in (settings.get("custom_buttons") or []):
-                    button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
-                reply_markup = InlineKeyboardMarkup(button)
+                button = _build_custom_buttons(settings)
                 try:
-                    msg = await info.copy(chat_id=message.from_user.id, protect_content=protect, reply_markup=reply_markup)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    msg = await info.copy(chat_id=message.from_user.id, protect_content=protect, reply_markup=reply_markup)
-                except:
+                    msg, _err = await _safe_copy(info, message.from_user.id, rows=button, protect=protect)
+                except Exception:
                     continue
             filesarr.append(msg)
             titles.append(title)
@@ -411,34 +476,38 @@ async def start(client, message):
         )
         return
     try:
-        msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
+        msg = await _get_log_message(client, int(decode_file_id))
         real_file_types = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
+        protect = settings.get("protect_content", False)
+        rows = _build_custom_buttons(settings)
         if msg.media and msg.media.value in real_file_types:
             media = getattr(msg, msg.media.value)
             orig_caption = getattr(msg, 'caption', None)
             orig_caption = orig_caption.html if orig_caption else None
-            title = orig_caption or formate_file_name(getattr(media, "file_name", ""))
-            size=get_size(media.file_size)
+            title = orig_caption or formate_file_name(getattr(media, "file_name", "")) or "File"
+            size = get_size(getattr(media, "file_size", 0) or 0)
             f_caption = f"<code>{title}</code>"
             single_caption = settings.get("custom_caption") or CUSTOM_FILE_CAPTION
             if single_caption:
                 try:
-                    f_caption=single_caption.format(file_name= '' if title is None else title, file_size='' if size is None else size, file_caption='' if title is None else title)
-                except:
+                    f_caption = single_caption.format(file_name=title, file_size=size, file_caption=title)
+                except Exception:
                     f_caption = f"<code>{title}</code>"
-            button = []
-            for row in (settings.get("custom_buttons") or []):
-                button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
-            button.extend(stream_download_buttons(msg.chat.id, msg.id, media))
-            reply_markup = InlineKeyboardMarkup(button)
-            del_msg = await msg.copy(chat_id=message.from_user.id, caption=f_caption, reply_markup=reply_markup, protect_content=settings.get("protect_content", False))
+            rows.extend(stream_download_buttons(msg.chat.id, msg.id, media))
+            del_msg, copy_err = await _safe_copy(msg, message.from_user.id, caption=f_caption, rows=rows, protect=protect)
         else:
+            # text / link / sticker / anything else: send as-is
             title = "Unknown File"
-            button = []
-            for row in (settings.get("custom_buttons") or []):
-                button.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
-            reply_markup = InlineKeyboardMarkup(button)
-            del_msg = await msg.copy(chat_id=message.from_user.id, reply_markup=reply_markup, protect_content=settings.get("protect_content", False))
+            del_msg, copy_err = await _safe_copy(msg, message.from_user.id, rows=rows, protect=protect)
+        if copy_err:
+            # file WAS delivered, but only after dropping caption/buttons -> tell admins why
+            logger.error(f"Delivered with fallback, first error: {copy_err}")
+            _spawn(_log_warning(
+                client,
+                f"<b>⚠️ #DeliveryFallback</b>\n\n🆔 Message ID: <code>{decode_file_id}</code>\n"
+                f"❌ First error: <code>{html.escape(str(copy_err))[:500]}</code>\n\n"
+                f"Check /settings → custom buttons / caption."
+            ))
         try:
             await client.send_message(
                 LOG_CHANNEL,
@@ -449,7 +518,7 @@ async def start(client, message):
             # Also forward the real accessed file into the log channel (not
             # just its name), in the background so delivery isn't delayed.
             asyncio.create_task(_forward_single_to_log(client, msg))
-        except:
+        except Exception:
             pass
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
@@ -465,20 +534,23 @@ async def start(client, message):
             _spawn(_delete_single_later(settings.get("auto_delete_time", 1800), del_msg, k))
         return
     except Exception as e:
-        logger.error(f"Failed to deliver file for decode_file_id={decode_file_id}: {e}")
+        logger.error(f"Failed to deliver file for decode_file_id={decode_file_id}: {e}", exc_info=True)
         try:
             await client.send_message(
                 LOG_CHANNEL,
                 f"<b>⚠️ #FileDeliveryFailed</b>\n\n"
                 f"👤 User: {message.from_user.mention} (<code>{message.from_user.id}</code>)\n"
                 f"🆔 Message ID tried: <code>{decode_file_id}</code>\n"
-                f"❌ Error: <code>{e}</code>"
+                f"❌ Error: <code>{html.escape(type(e).__name__ + ': ' + str(e))[:700]}</code>"
             )
-        except:
+        except Exception:
             pass
+        reason = ""
+        if message.from_user.id in ADMINS:  # only admins see the technical reason
+            reason = f"\n\n<code>{html.escape(type(e).__name__ + ': ' + str(e))[:500]}</code>"
         await message.reply_text(
             "<b>❌ This file could not be found or delivered. It may have been removed, or the link is broken. "
-            "Please ask the admin to generate a new link.</b>"
+            "Please ask the admin to generate a new link.</b>" + reason
         )
         
 
