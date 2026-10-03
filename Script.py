@@ -3,7 +3,7 @@
 class script(object):
     START_TXT = """<b>Hey {} !! 💌
 
-Welcome To Mrn Officialx File Store Bot! ✨❤️
+Welcome To MRN File Store Bot! ✨❤️
 
 📂 Access Your Content Easily Through The Links Provided. ⚡
 
