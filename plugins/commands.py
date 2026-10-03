@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import asyncio
+import time
 from validators import domain
 from Script import script
 from plugins.dbusers import db
@@ -113,29 +114,99 @@ def _spawn(coro):
     return task
 
 
-async def _delete_batch_later(delay, filesarr, notice):
-    """Auto-delete a delivered batch after `delay` seconds. Runs as a background
-    task so the /start handler (and its Pyrogram worker) is freed immediately
-    instead of sleeping for the whole auto-delete time."""
-    await asyncio.sleep(delay)
-    await asyncio.gather(*[x.delete() for x in filesarr], return_exceptions=True)
-    try:
-        await notice.edit_text("<b>Your All Files/Videos is successfully deleted!!!</b>")
-    except Exception:
-        pass
+# Pending auto-deletes are stored in MongoDB so they survive a restart/redeploy.
+# (Before, the timer lived only in memory: restart within the delay window =
+# the delivered files were never deleted.)
+_pending_col = db.db.pending_deletes
+_MAX_PENDING_AGE = 2 * 86400  # bots can't delete messages older than ~48h anyway
 
 
-async def _delete_single_later(delay, del_msg, notice):
-    """Same as above, for a single delivered file."""
-    await asyncio.sleep(delay)
+async def _schedule_delete(client, chat_id, msg_ids, notice, delay, final_text):
+    """Save the pending delete in MongoDB and start its timer. Never raises -
+    it runs after the file is already delivered and must not break /start."""
     try:
-        await del_msg.delete()
+        msg_ids = [int(i) for i in msg_ids]
+        delete_at = time.time() + delay
+        access_hash = None
+        try:
+            peer = await client.resolve_peer(chat_id)
+            access_hash = getattr(peer, "access_hash", None)
+        except Exception:
+            pass
+        pid = None
+        try:
+            res = await _pending_col.insert_one({
+                "chat_id": int(chat_id),
+                "access_hash": access_hash,
+                "msg_ids": msg_ids,
+                "notice_id": int(notice.id),
+                "final_text": final_text,
+                "delete_at": delete_at,
+            })
+            pid = res.inserted_id
+        except Exception as e:
+            logger.error(f"Could not save pending delete (timer still runs in memory): {e}")
+        _spawn(_run_delete(client, pid, int(chat_id), msg_ids, int(notice.id), delete_at, final_text))
+    except Exception:
+        logger.error("Failed to schedule auto-delete", exc_info=True)
+
+
+async def _run_delete(client, pid, chat_id, msg_ids, notice_id, delete_at, final_text):
+    wait = delete_at - time.time()
+    if wait > 0:
+        await asyncio.sleep(wait)
+    failed = False
+    for i in range(0, len(msg_ids), 100):
+        chunk = msg_ids[i:i + 100]
+        try:
+            await client.delete_messages(chat_id, chunk)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            try:
+                await client.delete_messages(chat_id, chunk)
+            except Exception:
+                failed = True
+        except Exception as e:
+            failed = True
+            logger.error(f"Auto-delete failed for chat {chat_id}: {e}")
+    try:
+        await client.edit_message_text(chat_id, notice_id, final_text)
     except Exception:
         pass
+    if pid is not None and not failed:
+        try:
+            await _pending_col.delete_one({"_id": pid})
+        except Exception:
+            pass
+
+
+async def restore_pending_deletes(client):
+    """Called once from bot.py after startup: re-arm every auto-delete that was
+    still waiting when the bot last stopped (overdue ones run immediately)."""
     try:
-        await notice.edit_text("<b>Your File/Video is successfully deleted!!!</b>")
-    except Exception:
-        pass
+        docs = await _pending_col.find({}).to_list(length=None)
+    except Exception as e:
+        logger.error(f"Could not load pending deletes: {e}")
+        return 0
+    now = time.time()
+    restored = 0
+    for d in docs:
+        try:
+            if now - d["delete_at"] > _MAX_PENDING_AGE:
+                await _pending_col.delete_one({"_id": d["_id"]})
+                continue
+            if d.get("access_hash"):
+                # the peer cache is empty after a restart - without this the user's
+                # chat can't be resolved and the delete would fail
+                try:
+                    await client.storage.update_peers([(d["chat_id"], d["access_hash"], "user", None, None)])
+                except Exception:
+                    pass
+            _spawn(_run_delete(client, d["_id"], d["chat_id"], d["msg_ids"], d["notice_id"], d["delete_at"], d["final_text"]))
+            restored += 1
+        except Exception:
+            logger.error("Bad pending-delete record skipped", exc_info=True)
+    return restored
 
 
 def _build_custom_buttons(settings):
@@ -313,7 +384,7 @@ async def start(client, message):
             )
     elif data.split("-", 1)[0] == "BATCH":
         try:
-            if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+            if VERIFY_MODE == True and not await check_verification(client, message.from_user.id):
                 btn = [[
                     InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
                 ],[
@@ -451,7 +522,9 @@ async def start(client, message):
                 f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
                 f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
-            _spawn(_delete_batch_later(settings.get("auto_delete_time", 1800), filesarr, k))
+            await _schedule_delete(client, message.from_user.id, [x.id for x in filesarr], k,
+                                   settings.get("auto_delete_time", 1800),
+                                   "<b>Your All Files/Videos is successfully deleted!!!</b>")
         return
 
 
@@ -463,7 +536,7 @@ async def start(client, message):
         # instead of crashing silently with no reply at all.
         await send_main_menu()
         return
-    if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+    if VERIFY_MODE == True and not await check_verification(client, message.from_user.id):
         btn = [[
             InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
         ],[
@@ -531,7 +604,9 @@ async def start(client, message):
                 f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
                 f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
             ))
-            _spawn(_delete_single_later(settings.get("auto_delete_time", 1800), del_msg, k))
+            await _schedule_delete(client, message.from_user.id, [del_msg.id], k,
+                                   settings.get("auto_delete_time", 1800),
+                                   "<b>Your File/Video is successfully deleted!!!</b>")
         return
     except Exception as e:
         logger.error(f"Failed to deliver file for decode_file_id={decode_file_id}: {e}", exc_info=True)
