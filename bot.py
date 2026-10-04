@@ -55,9 +55,10 @@ async def start():
 
     # Re-arm auto-deletes that were still pending when the bot last stopped
     try:
-        from plugins.commands import restore_pending_deletes
+        from plugins.commands import restore_pending_deletes, start_auto_delete_worker
         restored = await restore_pending_deletes(StreamBot)
         logging.info(f"Restored {restored} pending auto-delete(s)")
+        start_auto_delete_worker(StreamBot)
     except Exception as e:
         logging.error(f"Could not restore pending auto-deletes: {e}")
 
