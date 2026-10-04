@@ -151,33 +151,87 @@ async def _schedule_delete(client, chat_id, msg_ids, notice, delay, final_text):
         logger.error("Failed to schedule auto-delete", exc_info=True)
 
 
+async def _do_delete(client, chat_id, msg_ids, notice_id, final_text):
+    """Delete the delivered messages (100 per request), then mark the reminder
+    as done. Returns True only if everything was deleted."""
+    failed = False
+    deleted = 0
+    for i in range(0, len(msg_ids), 100):
+        chunk = msg_ids[i:i + 100]
+        for _ in range(2):  # 2nd pass only after a FloodWait
+            try:
+                deleted += (await client.delete_messages(chat_id, chunk)) or 0
+                break
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                failed = True
+                logger.error(f"[AUTO-DELETE] failed for chat {chat_id}: {type(e).__name__}: {e}")
+                break
+        else:
+            failed = True
+    if not failed and notice_id:
+        try:
+            await client.edit_message_text(chat_id, notice_id, final_text)
+        except Exception as e:
+            logger.warning(f"[AUTO-DELETE] could not edit reminder in chat {chat_id}: {e}")
+    logger.info(f"[AUTO-DELETE] chat {chat_id}: {deleted}/{len(msg_ids)} deleted, ok={not failed}")
+    return not failed
+
+
 async def _run_delete(client, pid, chat_id, msg_ids, notice_id, delete_at, final_text):
     wait = delete_at - time.time()
     if wait > 0:
         await asyncio.sleep(wait)
-    failed = False
-    for i in range(0, len(msg_ids), 100):
-        chunk = msg_ids[i:i + 100]
-        try:
-            await client.delete_messages(chat_id, chunk)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            try:
-                await client.delete_messages(chat_id, chunk)
-            except Exception:
-                failed = True
-        except Exception as e:
-            failed = True
-            logger.error(f"Auto-delete failed for chat {chat_id}: {e}")
-    try:
-        await client.edit_message_text(chat_id, notice_id, final_text)
-    except Exception:
-        pass
-    if pid is not None and not failed:
+    ok = await _do_delete(client, chat_id, msg_ids, notice_id, final_text)
+    if ok and pid is not None:
         try:
             await _pending_col.delete_one({"_id": pid})
         except Exception:
             pass
+
+
+_WORKER_GRACE = 60  # the in-memory timer gets this long to act first
+
+
+async def _process_overdue(client):
+    now = time.time()
+    while True:
+        # atomically claim one overdue record (lock keeps a second pass away from it)
+        d = await _pending_col.find_one_and_update(
+            {"delete_at": {"$lte": now - _WORKER_GRACE},
+             "$or": [{"lock_until": {"$exists": False}}, {"lock_until": {"$lt": now}}]},
+            {"$set": {"lock_until": now + 300}},
+        )
+        if not d:
+            return
+        if now - d["delete_at"] > _MAX_PENDING_AGE:
+            await _pending_col.delete_one({"_id": d["_id"]})
+            continue
+        if d.get("access_hash"):
+            try:
+                await client.storage.update_peers([(d["chat_id"], d["access_hash"], "user", None, None)])
+            except Exception:
+                pass
+        if await _do_delete(client, d["chat_id"], d["msg_ids"], d.get("notice_id"), d.get("final_text", "")):
+            await _pending_col.delete_one({"_id": d["_id"]})
+
+
+async def auto_delete_worker(client, interval=30):
+    """Safety net that does not depend on any in-memory timer: every `interval`
+    seconds it deletes whatever is overdue in MongoDB. Covers restarts, lost
+    timers, and failed attempts (retried until the record is 2 days old)."""
+    logger.info("[AUTO-DELETE] worker started")
+    while True:
+        try:
+            await _process_overdue(client)
+        except Exception:
+            logger.error("[AUTO-DELETE] worker pass failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
+def start_auto_delete_worker(client):
+    _spawn(auto_delete_worker(client))
 
 
 async def restore_pending_deletes(client):
