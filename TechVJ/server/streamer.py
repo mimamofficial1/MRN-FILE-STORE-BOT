@@ -140,6 +140,44 @@ def build_stream_urls(chat_id: int, message_id: int, file_name: str) -> Tuple[st
     return download_url, watch_url
 
 
+# ---------------------------------------------------------------------------
+# Permanent button links (for buttons the bot puts under channel posts).
+# Normal stream links expire (STREAM_LINK_TTL), which is useless for a button
+# that must keep working for months. So a button points to /go/..., a
+# never-expiring but signed entry link; every click is redirected to a brand
+# new, normal, short-lived /dl/ or /watch/ link. The signature is domain-
+# separated ("perm:") so it can never be confused with a normal stream token.
+# It is keyed with BOT_TOKEN, so changing the bot token kills old buttons.
+# ---------------------------------------------------------------------------
+
+def _perm_signature(chat_id: int, message_id: int) -> str:
+    msg = f"perm:{chat_id}:{message_id}".encode("ascii")
+    key = (BOT_TOKEN or "insecure-fallback-key").encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
+
+
+def build_permanent_urls(chat_id: int, message_id: int, file_name: str) -> Tuple[str, str]:
+    """(download_url, watch_url) that never expire. Pure string building."""
+    ref = base64.urlsafe_b64encode(f"{chat_id}:{message_id}".encode("ascii")).decode("ascii").rstrip("=")
+    sig = _perm_signature(chat_id, message_id)
+    safe_name = urllib.parse.quote(file_name or "file")
+    base = URL if URL.endswith("/") else URL + "/"
+    return f"{base}go/dl/{ref}/{safe_name}?hash={sig}", f"{base}go/watch/{ref}/{safe_name}?hash={sig}"
+
+
+def resolve_permanent_ref(ref: str, provided_sig: str) -> Tuple[int, int]:
+    """Verify a /go/ link. Raises InvalidStreamHash if malformed or forged."""
+    try:
+        padded = ref + "=" * (-len(ref) % 4)
+        chat_id_str, message_id_str = base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii").split(":", 1)
+        chat_id, message_id = int(chat_id_str), int(message_id_str)
+    except Exception:
+        raise InvalidStreamHash
+    if not hmac.compare_digest(_perm_signature(chat_id, message_id), provided_sig or ""):
+        raise InvalidStreamHash
+    return chat_id, message_id
+
+
 def humanbytes(size) -> str:
     if not size:
         return "0 B"

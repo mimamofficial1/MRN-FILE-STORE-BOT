@@ -1,5 +1,6 @@
 import time
 import logging
+import urllib.parse
 from aiohttp import web
 from aiohttp.http_exceptions import BadStatusLine
 from TechVJ.bot import StreamBot
@@ -8,7 +9,9 @@ from TechVJ.utils.watchdog import is_bot_healthy
 from TechVJ.server.streamer import (
     InvalidStreamHash,
     StreamFileNotFound,
+    build_stream_urls,
     render_watch_page,
+    resolve_permanent_ref,
     resolve_stream_token,
     stream_media,
 )
@@ -106,4 +109,27 @@ async def watch_route_handler(request: web.Request):
         raise
     except Exception as e:
         logger.error(f"watch page error: {e}")
+        raise web.HTTPInternalServerError(text="Something went wrong.")
+
+
+@routes.get(r"/go/{kind:dl|watch}/{ref}/{name:.*}", allow_head=True)
+async def permanent_button_route_handler(request: web.Request):
+    """Target of the buttons the bot adds under channel posts. The link itself
+    never expires (signed, see resolve_permanent_ref) but it only redirects to
+    a fresh short-lived /dl/ or /watch/ link, so STREAM_LINK_TTL still applies
+    to the actual stream."""
+    if not STREAM_MODE:
+        raise web.HTTPNotFound(text="Streaming is disabled on this bot.")
+    try:
+        chat_id, message_id = resolve_permanent_ref(request.match_info["ref"], request.rel_url.query.get("hash", ""))
+        name = urllib.parse.unquote(request.match_info.get("name", "")) or "file"
+        download_url, watch_url = build_stream_urls(chat_id, message_id, name)
+        target = download_url if request.match_info["kind"] == "dl" else watch_url
+        raise web.HTTPFound(target, headers={"Cache-Control": "no-store"})
+    except InvalidStreamHash as e:
+        raise web.HTTPForbidden(text=e.message)
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"permanent link error: {e}")
         raise web.HTTPInternalServerError(text="Something went wrong.")
