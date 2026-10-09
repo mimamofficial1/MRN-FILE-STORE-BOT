@@ -1,4 +1,4 @@
-pyrofork==2.3.45
+pyrofork==2.3.69
 TgCrypto==1.2.5
 aiohttp==3.14.3
 pymongo[srv]==3.12.3
