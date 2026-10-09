@@ -6,6 +6,7 @@ import time
 from validators import domain
 from Script import script
 from plugins.dbusers import db
+from TechVJ.utils.cover_copy import has_cover, copy_with_cover
 from pyrogram import Client, filters, enums
 from plugins.users_api import get_user, update_user_info
 from pyrogram.errors import ChatAdminRequired, FloodWait, PeerIdInvalid, ChannelInvalid
@@ -288,6 +289,28 @@ def _markup(rows):
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+async def _copy_one(src, chat_id, kw):
+    """One copy attempt. A video that carries a Telegram cover goes through
+    copy_with_cover (Pyrofork's copy() would silently drop the cover); if that
+    path fails for any non-flood reason we fall back to the normal copy, so
+    the file is still delivered - just without the cover."""
+    if has_cover(src):
+        try:
+            sent = await copy_with_cover(
+                src, chat_id,
+                caption=kw.get("caption"),
+                reply_markup=kw.get("reply_markup"),
+                protect_content=kw.get("protect_content", False),
+            )
+            if sent is not None:
+                return sent
+        except FloodWait:
+            raise
+        except Exception as e:
+            logger.warning(f"[COVER] cover copy failed, sending without cover: {type(e).__name__}: {e}")
+    return await src.copy(chat_id=chat_id, **kw)
+
+
 async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer=None):
     """Copy `src` to `chat_id`. If the fancy version (caption + buttons) is
     rejected by Telegram, retry with less and less until the user at least
@@ -305,7 +328,7 @@ async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer
         for _ in range(2):  # 2nd pass only used after a FloodWait
             try:
                 t0 = time.monotonic()
-                sent = await src.copy(chat_id=chat_id, **kw)
+                sent = await _copy_one(src, chat_id, kw)
                 if pacer is not None and time.monotonic() - t0 > 1.5:
                     # Pyrogram silently sleeps through short FloodWaits, so a slow
                     # copy = Telegram is throttling us -> slow the batch pace down

@@ -6,6 +6,7 @@ from plugins.users_api import get_user, get_short_link
 from plugins.settings_db import get_settings
 from plugins.admins_db import is_admin
 from plugins.dbusers import db
+from TechVJ.utils.cover_copy import copy_keep_cover
 import re
 import os
 import json
@@ -43,7 +44,7 @@ async def batch_allowed(_, __, message):
 async def incoming_gen_link(bot, message):
     username = (await bot.get_me()).username
     file_type = message.media
-    post = await message.copy(LOG_CHANNEL)
+    post = await copy_keep_cover(message, LOG_CHANNEL)
     file_id = str(post.id)
     string = 'file_'
     string += file_id
@@ -68,7 +69,7 @@ async def gen_link_s(bot, message):
     if not replied:
         return await message.reply('Reply to a message to get a shareable link.')
     
-    post = await replied.copy(LOG_CHANNEL)
+    post = await copy_keep_cover(replied, LOG_CHANNEL)
     file_id = str(post.id)
     string = f"file_"
     string += file_id
