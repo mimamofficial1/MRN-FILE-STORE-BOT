@@ -24,6 +24,7 @@ a lot of the reference bots this technique is copied from):
   large negative number.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -31,8 +32,10 @@ import html
 import logging
 import math
 import mimetypes
+import os
 import re
 import time
+from collections import deque
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
@@ -48,6 +51,22 @@ logger = logging.getLogger(__name__)
 
 MEDIA_TYPES = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
 CHUNK_SIZE = 1024 * 1024  # 1 MiB, must stay a multiple of 4096 (Telegram requirement)
+
+# Download speed: instead of asking Telegram for ONE 1 MiB chunk and waiting for
+# it before asking for the next (speed = 1 MiB / round-trip time), several
+# chunks are requested ahead of time, so the connection stays full.
+#   STREAM_PREFETCH      chunks kept in flight per download (RAM ~= this x 1 MiB)
+#   STREAM_MAX_INFLIGHT  cap on simultaneous Telegram requests across ALL downloads
+STREAM_PREFETCH = max(1, int(os.environ.get("STREAM_PREFETCH", "5") or 5))
+STREAM_MAX_INFLIGHT = max(1, int(os.environ.get("STREAM_MAX_INFLIGHT", "32") or 32))
+_inflight_sem = None
+
+
+def _get_inflight_sem():
+    global _inflight_sem
+    if _inflight_sem is None:  # created lazily: needs the running event loop
+        _inflight_sem = asyncio.Semaphore(STREAM_MAX_INFLIGHT)
+    return _inflight_sem
 
 
 class StreamFileNotFound(Exception):
@@ -226,6 +245,19 @@ class ByteStreamer:
         media_session = client.media_sessions.get(file_id.dc_id, None)
         if media_session is not None:
             return media_session
+        # Two first-time requests used to both build a session (one leaked).
+        locks = self.__dict__.setdefault("_session_locks", {})
+        async with locks.setdefault(file_id.dc_id, asyncio.Lock()):
+            media_session = client.media_sessions.get(file_id.dc_id, None)
+            if media_session is not None:  # someone else built it while we waited
+                return media_session
+            return await self._create_media_session(file_id)
+
+    async def _create_media_session(self, file_id: FileId) -> Session:
+        client = self.client
+        media_session = client.media_sessions.get(file_id.dc_id, None)
+        if media_session is not None:
+            return media_session
 
         if file_id.dc_id != await client.storage.dc_id():
             media_session = Session(
@@ -268,29 +300,50 @@ class ByteStreamer:
     async def yield_file(self, file_id, offset, first_part_cut, last_part_cut, part_count, chunk_size):
         media_session = await self.generate_media_session(file_id)
         location = await self.get_location(file_id)
-        current_part = 1
+        sem = _get_inflight_sem()
+        part_count = max(1, part_count)  # a 1-byte range gave 0 before
+
+        async def fetch(index):
+            async with sem:
+                r = await media_session.send(
+                    raw.functions.upload.GetFile(location=location, offset=offset + index * chunk_size, limit=chunk_size)
+                )
+            return r.bytes if isinstance(r, raw.types.upload.File) else b""
+
+        pending = deque()
+        next_index = 0
+
+        def refill():
+            nonlocal next_index
+            while next_index < part_count and len(pending) < STREAM_PREFETCH:
+                pending.append(asyncio.create_task(fetch(next_index)))
+                next_index += 1
+
         try:
-            r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size))
-            if isinstance(r, raw.types.upload.File):
-                while True:
-                    chunk = r.bytes
-                    if not chunk:
-                        break
-                    elif part_count == 1:
-                        yield chunk[first_part_cut:last_part_cut]
-                    elif current_part == 1:
-                        yield chunk[first_part_cut:]
-                    elif current_part == part_count:
-                        yield chunk[:last_part_cut]
-                    else:
-                        yield chunk
-                    current_part += 1
-                    offset += chunk_size
-                    if current_part > part_count:
-                        break
-                    r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size))
-        except (TimeoutError, AttributeError):
-            pass
+            refill()
+            current_part = 1
+            while pending:
+                try:
+                    chunk = await pending.popleft()
+                except (TimeoutError, AttributeError):
+                    break
+                if not chunk:
+                    break
+                refill()  # top the pipe up BEFORE handing this chunk to the client
+                if part_count == 1:
+                    yield chunk[first_part_cut:last_part_cut]
+                elif current_part == 1:
+                    yield chunk[first_part_cut:]
+                elif current_part == part_count:
+                    yield chunk[:last_part_cut]
+                else:
+                    yield chunk
+                current_part += 1
+        finally:
+            # client left / error / done: stop every chunk still being fetched
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 # Created lazily (on first request) rather than at import time, since building
@@ -335,17 +388,21 @@ async def stream_media(request: web.Request, chat_id: int, message_id: int) -> w
     first_part_cut = from_bytes - offset
     last_part_cut = until_bytes % CHUNK_SIZE + 1
     req_length = until_bytes - from_bytes + 1
-    part_count = math.ceil(until_bytes / CHUNK_SIZE) - math.floor(offset / CHUNK_SIZE)
-
-    body = streamer.yield_file(file_id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE)
+    # chunks touched by the range, both ends inclusive. (The old ceil/floor formula
+    # came up one short when the last byte sat exactly at the start of a chunk,
+    # e.g. bytes=1048575-1048576 -> a truncated body and a download that hangs.)
+    part_count = until_bytes // CHUNK_SIZE - offset // CHUNK_SIZE + 1
 
     mime_type = file_id.mime_type or (mimetypes.guess_type(file_id.file_name or "")[0]) or "application/octet-stream"
     file_name = file_id.file_name or "file"
     disposition = "attachment" if request.rel_url.query.get("dl") == "1" else "inline"
 
-    return web.Response(
+    # Build the Telegram media session BEFORE the headers go out, so a failure
+    # here is a normal HTTP error and not a half-sent 200.
+    await streamer.generate_media_session(file_id)
+
+    resp = web.StreamResponse(
         status=206 if range_header else 200,
-        body=body,
         headers={
             "Content-Type": mime_type,
             "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
@@ -358,6 +415,30 @@ async def stream_media(request: web.Request, chat_id: int, message_id: int) -> w
             "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         },
     )
+    await resp.prepare(request)
+    if request.method == "HEAD":
+        return resp
+
+    body = streamer.yield_file(file_id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE)
+    sent = 0
+    try:
+        async for chunk in body:
+            await resp.write(chunk)
+            sent += len(chunk)
+        if sent < req_length:
+            # Telegram stopped early (timeout). Drop the connection so the client
+            # sees an error and can resume - otherwise it would wait forever for
+            # the missing bytes.
+            logger.warning(f"stream ended early: sent {sent} of {req_length} bytes")
+            if request.transport is not None:
+                request.transport.close()
+        else:
+            await resp.write_eof()
+    except (ConnectionResetError, ConnectionError):
+        pass  # the client went away; the finally below stops the prefetching
+    finally:
+        await body.aclose()
+    return resp
 
 
 _WATCH_PAGE = r"""<!DOCTYPE html>
