@@ -2,18 +2,20 @@ import os
 import logging
 import random
 import asyncio
+import time
 from validators import domain
 from Script import script
 from plugins.dbusers import db
+from TechVJ.utils.cover_copy import has_cover, copy_with_cover
 from pyrogram import Client, filters, enums
 from plugins.users_api import get_user, update_user_info
-from pyrogram.errors import ChatAdminRequired, FloodWait
+from pyrogram.errors import ChatAdminRequired, FloodWait, PeerIdInvalid, ChannelInvalid
+import html
 from pyrogram.types import *
 from utils import verify_user, check_token, check_verification, get_token
 from plugins.settings_db import get_settings
 from plugins.force_sub import not_joined_channels, force_sub_join_buttons, get_missing_and_buttons
 from TechVJ.server.streamer import build_stream_urls
-from TechVJ.utils.cover_copy import copy_keep_cover as _copy_media
 from config import *
 import re
 import json
@@ -45,46 +47,24 @@ def formate_file_name(file_name):
 
 
 def stream_download_buttons(chat_id, message_id, media):
-    """Fast Download / Watch Online buttons only for supported file types."""
+    """Fast Download / Watch Online button row for a delivered file.
+    Built from data already in hand (no extra Telegram API call). Returns
+    [] if STREAM_MODE is off or the media has no usable file info."""
     if not STREAM_MODE:
         return []
-
     try:
-        # Sticker/photo/animation/voice/video_note etc. -> NO stream buttons
-        media_type = type(media).__name__.lower()
-
-        if media_type not in ("document", "video", "audio"):
-            return []
-
-        file_name = getattr(media, "file_name", None)
-        if not file_name:
-            return []
-
         download_url, watch_url = build_stream_urls(
-            chat_id,
-            message_id,
-            getattr(media, "file_unique_id", ""),
-            file_name,
+            chat_id, message_id,
+            getattr(media, "file_name", "") or "file",
         )
-
         return [[
-            InlineKeyboardButton(
-                '🚀 ꜰᴀsᴛ ᴅᴏᴡɴʟᴏᴀᴅ',
-                url=download_url
-            ),
-            InlineKeyboardButton(
-                '🖥 ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ',
-                url=watch_url
-            ),
+            InlineKeyboardButton('🚀 ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ 🚀', url=download_url),
+            InlineKeyboardButton('🖥 ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ 🖥', url=watch_url),
         ]]
-
     except Exception:
-        logger.error(
-            "Failed to build stream/download buttons",
-            exc_info=True
-        )
+        logger.error("Failed to build stream/download buttons", exc_info=True)
         return []
-        
+
 
 async def _forward_accessed_to_log(client, refs):
     """Forward the actual files/videos a user just accessed (batch) into
@@ -135,27 +115,255 @@ def _spawn(coro):
     return task
 
 
-async def _delete_batch_later(delay, filesarr, notice):
-    """Auto-delete a delivered batch after `delay` seconds. Runs as a background
-    task so the /start handler (and its Pyrogram worker) is freed immediately
-    instead of sleeping for the whole auto-delete time."""
-    await asyncio.sleep(delay)
-    await asyncio.gather(*[x.delete() for x in filesarr], return_exceptions=True)
-    try:
-        await notice.edit_text("<b>Your All Files/Videos is successfully deleted!!!</b>")
-    except Exception:
-        pass
+# Pending auto-deletes are stored in MongoDB so they survive a restart/redeploy.
+# (Before, the timer lived only in memory: restart within the delay window =
+# the delivered files were never deleted.)
+_pending_col = db.db.pending_deletes
+_MAX_PENDING_AGE = 2 * 86400  # bots can't delete messages older than ~48h anyway
 
 
-async def _delete_single_later(delay, del_msg, notice):
-    """Same as above, for a single delivered file."""
-    await asyncio.sleep(delay)
+async def _schedule_delete(client, chat_id, msg_ids, notice, delay, final_text):
+    """Save the pending delete in MongoDB and start its timer. Never raises -
+    it runs after the file is already delivered and must not break /start."""
     try:
-        await del_msg.delete()
+        msg_ids = [int(i) for i in msg_ids]
+        delete_at = time.time() + delay
+        access_hash = None
+        try:
+            peer = await client.resolve_peer(chat_id)
+            access_hash = getattr(peer, "access_hash", None)
+        except Exception:
+            pass
+        pid = None
+        try:
+            res = await _pending_col.insert_one({
+                "chat_id": int(chat_id),
+                "access_hash": access_hash,
+                "msg_ids": msg_ids,
+                "notice_id": int(notice.id),
+                "final_text": final_text,
+                "delete_at": delete_at,
+            })
+            pid = res.inserted_id
+        except Exception as e:
+            logger.error(f"Could not save pending delete (timer still runs in memory): {e}")
+        _spawn(_run_delete(client, pid, int(chat_id), msg_ids, int(notice.id), delete_at, final_text))
     except Exception:
-        pass
+        logger.error("Failed to schedule auto-delete", exc_info=True)
+
+
+async def _do_delete(client, chat_id, msg_ids, notice_id, final_text):
+    """Delete the delivered messages (100 per request), then mark the reminder
+    as done. Returns True only if everything was deleted."""
+    failed = False
+    deleted = 0
+    for i in range(0, len(msg_ids), 100):
+        chunk = msg_ids[i:i + 100]
+        for _ in range(2):  # 2nd pass only after a FloodWait
+            try:
+                deleted += (await client.delete_messages(chat_id, chunk)) or 0
+                break
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                failed = True
+                logger.error(f"[AUTO-DELETE] failed for chat {chat_id}: {type(e).__name__}: {e}")
+                break
+        else:
+            failed = True
+    if not failed and notice_id:
+        try:
+            await client.edit_message_text(chat_id, notice_id, final_text)
+        except Exception as e:
+            logger.warning(f"[AUTO-DELETE] could not edit reminder in chat {chat_id}: {e}")
+    logger.info(f"[AUTO-DELETE] chat {chat_id}: {deleted}/{len(msg_ids)} deleted, ok={not failed}")
+    return not failed
+
+
+async def _run_delete(client, pid, chat_id, msg_ids, notice_id, delete_at, final_text):
+    wait = delete_at - time.time()
+    if wait > 0:
+        await asyncio.sleep(wait)
+    ok = await _do_delete(client, chat_id, msg_ids, notice_id, final_text)
+    if ok and pid is not None:
+        try:
+            await _pending_col.delete_one({"_id": pid})
+        except Exception:
+            pass
+
+
+_WORKER_GRACE = 60  # the in-memory timer gets this long to act first
+
+
+async def _process_overdue(client):
+    now = time.time()
+    while True:
+        # atomically claim one overdue record (lock keeps a second pass away from it)
+        d = await _pending_col.find_one_and_update(
+            {"delete_at": {"$lte": now - _WORKER_GRACE},
+             "$or": [{"lock_until": {"$exists": False}}, {"lock_until": {"$lt": now}}]},
+            {"$set": {"lock_until": now + 300}},
+        )
+        if not d:
+            return
+        if now - d["delete_at"] > _MAX_PENDING_AGE:
+            await _pending_col.delete_one({"_id": d["_id"]})
+            continue
+        if d.get("access_hash"):
+            try:
+                await client.storage.update_peers([(d["chat_id"], d["access_hash"], "user", None, None)])
+            except Exception:
+                pass
+        if await _do_delete(client, d["chat_id"], d["msg_ids"], d.get("notice_id"), d.get("final_text", "")):
+            await _pending_col.delete_one({"_id": d["_id"]})
+
+
+async def auto_delete_worker(client, interval=30):
+    """Safety net that does not depend on any in-memory timer: every `interval`
+    seconds it deletes whatever is overdue in MongoDB. Covers restarts, lost
+    timers, and failed attempts (retried until the record is 2 days old)."""
+    logger.info("[AUTO-DELETE] worker started")
+    while True:
+        try:
+            await _process_overdue(client)
+        except Exception:
+            logger.error("[AUTO-DELETE] worker pass failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
+def start_auto_delete_worker(client):
+    _spawn(auto_delete_worker(client))
+
+
+async def restore_pending_deletes(client):
+    """Called once from bot.py after startup: re-arm every auto-delete that was
+    still waiting when the bot last stopped (overdue ones run immediately)."""
     try:
-        await notice.edit_text("<b>Your File/Video is successfully deleted!!!</b>")
+        docs = await _pending_col.find({}).to_list(length=None)
+    except Exception as e:
+        logger.error(f"Could not load pending deletes: {e}")
+        return 0
+    now = time.time()
+    restored = 0
+    for d in docs:
+        try:
+            if now - d["delete_at"] > _MAX_PENDING_AGE:
+                await _pending_col.delete_one({"_id": d["_id"]})
+                continue
+            if d.get("access_hash"):
+                # the peer cache is empty after a restart - without this the user's
+                # chat can't be resolved and the delete would fail
+                try:
+                    await client.storage.update_peers([(d["chat_id"], d["access_hash"], "user", None, None)])
+                except Exception:
+                    pass
+            _spawn(_run_delete(client, d["_id"], d["chat_id"], d["msg_ids"], d["notice_id"], d["delete_at"], d["final_text"]))
+            restored += 1
+        except Exception:
+            logger.error("Bad pending-delete record skipped", exc_info=True)
+    return restored
+
+
+def _build_custom_buttons(settings):
+    """Rows of valid custom buttons from /settings. Anything with an empty text
+    or a non-link url is skipped - ONE bad button used to make Telegram reject
+    every single delivery (BUTTON_URL_INVALID) -> 'file could not be found'."""
+    rows = []
+    for row in (settings.get("custom_buttons") or []):
+        btns = []
+        for b in row:
+            try:
+                text = (b.get("text") or "").strip()
+                url = (b.get("url") or "").strip()
+            except AttributeError:
+                continue
+            if text and url.startswith(("http://", "https://", "tg://")):
+                btns.append(InlineKeyboardButton(text, url=url))
+        if btns:
+            rows.append(btns)
+    return rows
+
+
+def _markup(rows):
+    # never send an empty InlineKeyboardMarkup([]) - use no markup at all
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _copy_one(src, chat_id, kw):
+    """One copy attempt. A video that carries a Telegram cover goes through
+    copy_with_cover (Pyrofork's copy() would silently drop the cover); if that
+    path fails for any non-flood reason we fall back to the normal copy, so
+    the file is still delivered - just without the cover."""
+    if has_cover(src):
+        try:
+            sent = await copy_with_cover(
+                src, chat_id,
+                caption=kw.get("caption"),
+                reply_markup=kw.get("reply_markup"),
+                protect_content=kw.get("protect_content", False),
+            )
+            if sent is not None:
+                return sent
+        except FloodWait:
+            raise
+        except Exception as e:
+            logger.warning(f"[COVER] cover copy failed, sending without cover: {type(e).__name__}: {e}")
+    return await src.copy(chat_id=chat_id, **kw)
+
+
+async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer=None):
+    """Copy `src` to `chat_id`. If the fancy version (caption + buttons) is
+    rejected by Telegram, retry with less and less until the user at least
+    gets the file. Returns (sent_message, first_error_or_None)."""
+    attempts = [
+        {"caption": caption, "reply_markup": _markup(rows), "protect_content": protect},
+        {"caption": caption, "protect_content": protect},
+        {"protect_content": protect},
+        {},
+    ]
+    first_error = None
+    last_error = None
+    for kw in attempts:
+        kw = {k: v for k, v in kw.items() if not (k == "caption" and v is None)}
+        for _ in range(2):  # 2nd pass only used after a FloodWait
+            try:
+                t0 = time.monotonic()
+                sent = await _copy_one(src, chat_id, kw)
+                if pacer is not None and time.monotonic() - t0 > 1.5:
+                    # Pyrogram silently sleeps through short FloodWaits, so a slow
+                    # copy = Telegram is throttling us -> slow the batch pace down
+                    pacer["delay"] = min(pacer["delay"] * 2, 1.0)
+                return sent, first_error
+            except FloodWait as e:
+                if pacer is not None:
+                    pacer["delay"] = min(pacer["delay"] * 2, 1.0)
+                await asyncio.sleep(e.value)
+                continue
+            except Exception as e:
+                last_error = e
+                if first_error is None:
+                    first_error = e
+                break
+    raise last_error
+
+
+async def _get_log_message(client, mid):
+    """Fetch a stored message from LOG_CHANNEL. Re-resolves the channel if the
+    bot's peer cache is empty (happens after a redeploy) and fails loudly if
+    the message is gone, instead of returning an empty Message."""
+    try:
+        msg = await client.get_messages(LOG_CHANNEL, mid)
+    except (PeerIdInvalid, ChannelInvalid):
+        await client.get_chat(LOG_CHANNEL)
+        msg = await client.get_messages(LOG_CHANNEL, mid)
+    if not msg or msg.empty:
+        raise ValueError(f"Message {mid} not found in LOG_CHANNEL (deleted, or wrong LOG_CHANNEL)")
+    return msg
+
+
+async def _log_warning(client, text):
+    try:
+        await client.send_message(LOG_CHANNEL, text)
     except Exception:
         pass
 
@@ -193,12 +401,15 @@ async def start(client, message):
             disable_web_page_preview=True
         )
 
-    if len(message.command) != 2:
+    async def send_main_menu():
+        """The default /start greeting (menu + custom/default welcome photo).
+        Used for a plain /start, and as a safe fallback whenever a start
+        parameter turns out to not be a real, decodable file link."""
         buttons = [[
-            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/RudraBlaze'),
-            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/ChillFlizX')
+            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
             ],[
-            InlineKeyboardButton('💁‍♂️ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('💁‍♂ ʜᴇʟᴘ', callback_data='help'),
             InlineKeyboardButton('💎 ᴀʙᴏᴜᴛ', callback_data='about')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
@@ -222,6 +433,9 @@ async def start(client, message):
                 caption=start_caption,
                 reply_markup=reply_markup
             )
+
+    if len(message.command) != 2:
+        await send_main_menu()
         return
 
     
@@ -254,7 +468,7 @@ async def start(client, message):
             )
     elif data.split("-", 1)[0] == "BATCH":
         try:
-            if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+            if VERIFY_MODE == True and not await check_verification(client, message.from_user.id):
                 btn = [[
                     InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
                 ],[
@@ -274,57 +488,9 @@ async def start(client, message):
         if not msgs:
             decode_file_id = base64.urlsafe_b64decode(file_id + "=" * (-len(file_id) % 4)).decode("ascii")
             msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
-            # Sticker: copy directly without Stream/Download buttons
-            if msg.sticker:
-                try:
-                    del_msg = await msg.copy(
-                        chat_id=message.from_user.id,
-                        protect_content=settings.get("protect_content", False)
-                    )
-
-                    title = "Sticker"
-
-                    await client.send_message(
-                        LOG_CHANNEL,
-                        f"<b>📥 #FileAccess</b>\n\n"
-                        f"👤 User: {message.from_user.mention} (<code>{message.from_user.id}</code>)\n"
-                        f"🎬 File: <code>{title}</code>"
-                    )
-                    
-                    asyncio.create_task(_forward_single_to_log(client, msg))
-
-                    if settings.get("auto_delete", True):
-                        del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
-
-                        k = await client.send_message(
-                            chat_id=message.from_user.id,
-                            text=f"<b>🔔 Just a Quick Reminder !!\n\n"
-                            f"⏳ This Content Will Be Automatically Deleted After <u>{del_minutes} Minutes</u> Due to Copyright Issues.\n\n"
-                            f"🔗 Once Deleted, You’ll Need to Open the Link Again to Access It.\n\n"
-                            f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
-                            f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
-                            f"👨‍💻 Powered By @ChillFlizX⚡️\n\n"
-                            f"🧑‍🔧 Help & Support >>> @ChillFlizOwnerBot</b>"
-                        )
-
-                        _spawn(
-                            _delete_single_later(
-                                settings.get("auto_delete_time", 1800),
-                                del_msg,
-                                k
-                            )
-                        )
-
-                    return
-                
-                except Exception as e:
-                    logger.error(f"Failed to deliver sticker: {e}", exc_info=True)
-                    return await message.reply_text(
-                        "<b>❌ Sticker could not be delivered.</b>"
-                    )
             media = getattr(msg, msg.media.value)
             file = await client.download_media(media.file_id)  # keep file_id intact - it is the BATCH_FILES cache key
-            try:
+            try: 
                 with open(file) as file_data:
                     msgs=json.loads(file_data.read())
             except:
@@ -361,140 +527,52 @@ async def start(client, message):
                     results = await client.get_messages(ch, chunk)
                 except Exception:
                     results = []
-
                 for r in results or []:
                     if r:
                         fetched[(ch, r.id)] = r
 
+        pacer = {"delay": 0.25}  # starts fast; doubles (max 1s) whenever Telegram throttles
         for channel_id, msgid in order:
             info = fetched.get((channel_id, msgid))
             if not info:
                 continue
-
-            if info.sticker:
-                try:
-                    msg = await info.copy(
-                        chat_id=message.from_user.id,
-                        protect_content=settings.get("protect_content", False)
-                    )
-                    title = "Sticker"
-                    filesarr.append(msg)
-                    titles.append(title)
-                    accessed_refs.append((channel_id, msgid))
-
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    try:
-                        msg = await info.copy(
-                            chat_id=message.from_user.id,
-                            protect_content=settings.get("protect_content", False)
-                        )
-                        title = "Sticker"
-                        filesarr.append(msg)
-                        titles.append(title)
-                        accessed_refs.append((channel_id, msgid))
-                    except Exception:
-                        continue
-
-                except Exception:
-                    continue
-
-                await asyncio.sleep(0.6)
-                continue
-
             if info.media:
                 file_type = info.media
                 file = getattr(info, file_type.value)
-
-                f_caption = getattr(info, "caption", "")
+                f_caption = getattr(info, 'caption', '')
                 if f_caption:
                     f_caption = f_caption.html
-
                 old_title = getattr(file, "file_name", "")
                 title = formate_file_name(old_title)
-                size = get_size(int(file.file_size))
-
+                size=get_size(int(file.file_size))
                 batch_caption = settings.get("custom_caption") or BATCH_FILE_CAPTION
-
                 if batch_caption:
                     try:
-                        f_caption = batch_caption.format(
-                            file_name="" if title is None else title,
-                            file_size="" if size is None else size,
-                            file_caption="" if f_caption is None else f_caption
-                        )
-                    except Exception:
-                        pass
-
+                        f_caption=batch_caption.format(file_name= '' if title is None else title, file_size='' if size is None else size, file_caption='' if f_caption is None else f_caption)
+                    except:
+                        f_caption=f_caption
                 if f_caption is None:
                     f_caption = f"{title}"
-
-                button = []
-
-                for row in (settings.get("custom_buttons") or []):
-                    button.append([
-                        InlineKeyboardButton(b["text"], url=b["url"])
-                        for b in row
-                    ])
-
+                button = _build_custom_buttons(settings)
                 button.extend(stream_download_buttons(channel_id, msgid, file))
-                reply_markup = InlineKeyboardMarkup(button)
                 protect = settings.get("protect_content", False)
-
                 try:
-                    msg = await _copy_media(
-                        info,
-                        message.from_user.id,
-                        caption=f_caption,
-                        protect_content=protect,
-                        reply_markup=reply_markup
-                    )
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    msg = await _copy_media(
-                        info,
-                        message.from_user.id,
-                        caption=f_caption,
-                        protect_content=protect,
-                        reply_markup=reply_markup
-                    )
+                    msg, _err = await _safe_copy(info, message.from_user.id, caption=f_caption, rows=button, protect=protect, pacer=pacer)
                 except Exception:
                     continue
-
             else:
                 title = "Unknown File"
+                title = "Unknown File"
                 protect = settings.get("protect_content", False)
-
-                button = []
-
-                for row in (settings.get("custom_buttons") or []):
-                    button.append([
-                        InlineKeyboardButton(b["text"], url=b["url"])
-                        for b in row
-                    ])
-
-                reply_markup = InlineKeyboardMarkup(button)
-
+                button = _build_custom_buttons(settings)
                 try:
-                    msg = await info.copy(
-                        chat_id=message.from_user.id,
-                        protect_content=protect,
-                        reply_markup=reply_markup
-                    )
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
-                    msg = await info.copy(
-                        chat_id=message.from_user.id,
-                        protect_content=protect,
-                        reply_markup=reply_markup
-                    )
+                    msg, _err = await _safe_copy(info, message.from_user.id, rows=button, protect=protect, pacer=pacer)
                 except Exception:
                     continue
-
             filesarr.append(msg)
             titles.append(title)
             accessed_refs.append((channel_id, msgid))
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(pacer["delay"])
         try:
             if titles:
                 shown = titles[:30]
@@ -520,22 +598,30 @@ async def start(client, message):
         await sts.delete()
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
-            k = await client.send_message(
-                chat_id = message.from_user.id,
-                text=f"<b>🔔 Just a Quick Reminder !!\n\n"
+            k = await client.send_message(chat_id = message.from_user.id, text=(
+                f"🔔 <b><u>Just a Quick Reminder !!</u>\n\n"
                 f"⏳ This Content Will Be Automatically Deleted After <u>{del_minutes} Minutes</u> Due to Copyright Issues.\n\n"
-                f"🔗 Once Deleted, You’ll Need to Open the Link Again to Access It.\n\n"
+                f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
-                f"👨‍💻 Powered By @ChillFlizX⚡️\n\n"
-                f"🧑‍🔧 Help & Support >>> @ChillFlizOwnerBot</b>"
-            )
-            _spawn(_delete_batch_later(settings.get("auto_delete_time", 1800), filesarr, k))
+                f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
+                f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
+            ))
+            await _schedule_delete(client, message.from_user.id, [x.id for x in filesarr], k,
+                                   settings.get("auto_delete_time", 1800),
+                                   "<b>Your All Files/Videos is successfully deleted!!!</b>")
         return
 
 
-    pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
-    if not await check_verification(client, message.from_user.id) and VERIFY_MODE == True:
+    try:
+        pre, decode_file_id = ((base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))).decode("ascii")).split("_", 1)
+    except Exception:
+        # Not a real file link (e.g. the "?start=true" Continue button used after
+        # force-sub when there was no original deep-link param) - just greet them
+        # instead of crashing silently with no reply at all.
+        await send_main_menu()
+        return
+    if VERIFY_MODE == True and not await check_verification(client, message.from_user.id):
         btn = [[
             InlineKeyboardButton("Verify", url=await get_token(client, message.from_user.id, f"https://telegram.me/{username}?start="))
         ],[
@@ -548,153 +634,38 @@ async def start(client, message):
         )
         return
     try:
-        msg = await client.get_messages(LOG_CHANNEL, int(decode_file_id))
-
-        # Sticker: send directly without caption/buttons
-        if msg.sticker:
-            title = "Sticker"
-
-            del_msg = await msg.copy(
-                chat_id=message.from_user.id,
-                protect_content=settings.get("protect_content", False)
-            )
-
-        # Text message: send text directly without media/buttons
-        elif msg.text:
-            title = "Text Message"
-
-            del_msg = await client.send_message(
-                chat_id=message.from_user.id,
-                text=msg.text,
-                entities=msg.entities,
-                protect_content=settings.get("protect_content", False)
-            )
-
-        # Media files
-        elif msg.media:
+        msg = await _get_log_message(client, int(decode_file_id))
+        real_file_types = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
+        protect = settings.get("protect_content", False)
+        rows = _build_custom_buttons(settings)
+        if msg.media and msg.media.value in real_file_types:
             media = getattr(msg, msg.media.value)
-            media_type = msg.media.value
-
-            # Photo
-            if media_type == "photo":
-                orig_caption = getattr(msg, "caption", None)
-                photo_caption = orig_caption.html if orig_caption else None
-
-                title = "Photo"
-
-                button = []
-
-                for row in (settings.get("custom_buttons") or []):
-                    button.append([
-                        InlineKeyboardButton(
-                            b["text"],
-                            url=b["url"]
-                        )
-                        for b in row
-                    ])
-
-                reply_markup = InlineKeyboardMarkup(button) if button else None
-
-                del_msg = await msg.copy(
-                    chat_id=message.from_user.id,
-                    caption=photo_caption,
-                    reply_markup=reply_markup,
-                    protect_content=settings.get("protect_content", False)
-                )
-
-            else:
-                real_file_types = (
-                    "document",
-                    "video",
-                    "audio",
-                    "animation",
-                    "voice",
-                    "video_note"
-                )
-
-                if media_type in real_file_types:
-                    orig_caption = getattr(msg, "caption", None)
-                    orig_caption = orig_caption.html if orig_caption else None
-
-                    title = orig_caption or formate_file_name(
-                        getattr(media, "file_name", "")
-                    )
-
-                    file_size = getattr(media, "file_size", 0) or 0
-                    size = get_size(file_size)
-
+            orig_caption = getattr(msg, 'caption', None)
+            orig_caption = orig_caption.html if orig_caption else None
+            title = orig_caption or formate_file_name(getattr(media, "file_name", "")) or "File"
+            size = get_size(getattr(media, "file_size", 0) or 0)
+            f_caption = f"<code>{title}</code>"
+            single_caption = settings.get("custom_caption") or CUSTOM_FILE_CAPTION
+            if single_caption:
+                try:
+                    f_caption = single_caption.format(file_name=title, file_size=size, file_caption=title)
+                except Exception:
                     f_caption = f"<code>{title}</code>"
-
-                    single_caption = settings.get("custom_caption") or CUSTOM_FILE_CAPTION
-
-                    if single_caption:
-                        try:
-                            f_caption = single_caption.format(
-                                file_name="" if title is None else title,
-                                file_size="" if size is None else size,
-                                file_caption="" if title is None else title
-                            )
-                        except Exception:
-                            f_caption = f"<code>{title}</code>"
-
-                    button = []
-
-                    for row in (settings.get("custom_buttons") or []):
-                        button.append([
-                            InlineKeyboardButton(
-                                b["text"],
-                                url=b["url"]
-                            )
-                            for b in row
-                        ])
-
-                    button.extend(
-                        stream_download_buttons(
-                            msg.chat.id,
-                            msg.id,
-                            media
-                        )
-                    )
-
-                    reply_markup = InlineKeyboardMarkup(button)
-
-                    del_msg = await _copy_media(
-                        msg,
-                        message.from_user.id,
-                        caption=f_caption,
-                        reply_markup=reply_markup,
-                        protect_content=settings.get("protect_content", False)
-                    )
-
-                else:
-                    title = "File"
-
-                    button = []
-
-                    for row in (settings.get("custom_buttons") or []):
-                        button.append([
-                            InlineKeyboardButton(
-                                b["text"],
-                                url=b["url"]
-                            )
-                            for b in row
-                        ])
-
-                    reply_markup = InlineKeyboardMarkup(button) if button else None
-
-                    del_msg = await msg.copy(
-                        chat_id=message.from_user.id,
-                        reply_markup=reply_markup,
-                        protect_content=settings.get("protect_content", False)
-                    )
-
+            rows.extend(stream_download_buttons(msg.chat.id, msg.id, media))
+            del_msg, copy_err = await _safe_copy(msg, message.from_user.id, caption=f_caption, rows=rows, protect=protect)
         else:
-            title = "Unknown Message"
-
-            del_msg = await msg.copy(
-                chat_id=message.from_user.id,
-                protect_content=settings.get("protect_content", False)
-            )
+            # text / link / sticker / anything else: send as-is
+            title = "Unknown File"
+            del_msg, copy_err = await _safe_copy(msg, message.from_user.id, rows=rows, protect=protect)
+        if copy_err:
+            # file WAS delivered, but only after dropping caption/buttons -> tell admins why
+            logger.error(f"Delivered with fallback, first error: {copy_err}")
+            _spawn(_log_warning(
+                client,
+                f"<b>⚠️ #DeliveryFallback</b>\n\n🆔 Message ID: <code>{decode_file_id}</code>\n"
+                f"❌ First error: <code>{html.escape(str(copy_err))[:500]}</code>\n\n"
+                f"Check /settings → custom buttons / caption."
+            ))
         try:
             await client.send_message(
                 LOG_CHANNEL,
@@ -705,37 +676,41 @@ async def start(client, message):
             # Also forward the real accessed file into the log channel (not
             # just its name), in the background so delivery isn't delayed.
             asyncio.create_task(_forward_single_to_log(client, msg))
-        except:
+        except Exception:
             pass
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
-            k = await client.send_message(
-                chat_id = message.from_user.id,
-                text=f"<b>🔔 Just a Quick Reminder !!\n\n"
+            k = await client.send_message(chat_id = message.from_user.id, text=(
+                f"🔔 <b><u>Just a Quick Reminder !!</u>\n\n"
                 f"⏳ This Content Will Be Automatically Deleted After <u>{del_minutes} Minutes</u> Due to Copyright Issues.\n\n"
-                f"🔗 Once Deleted, You’ll Need to Open the Link Again to Access It.\n\n"
+                f"🔗 Once Deleted, You'll Need to Open the Link Again to Access It.\n\n"
                 f"📌 Want to Keep It? Save or Forward It to your Saved Messages Before It Expires. 👍\n\n"
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
-                f"👨‍💻 Powered By @ChillFlizX⚡️\n\n"
-                f"🧑‍🔧 Help & Support >>> @ChillFlizOwnerBot</b>"
-            )
-            _spawn(_delete_single_later(settings.get("auto_delete_time", 1800), del_msg, k))
+                f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
+                f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
+            ))
+            await _schedule_delete(client, message.from_user.id, [del_msg.id], k,
+                                   settings.get("auto_delete_time", 1800),
+                                   "<b>Your File/Video is successfully deleted!!!</b>")
         return
     except Exception as e:
-        logger.error(f"Failed to deliver file for decode_file_id={decode_file_id}: {e}")
+        logger.error(f"Failed to deliver file for decode_file_id={decode_file_id}: {e}", exc_info=True)
         try:
             await client.send_message(
                 LOG_CHANNEL,
                 f"<b>⚠️ #FileDeliveryFailed</b>\n\n"
                 f"👤 User: {message.from_user.mention} (<code>{message.from_user.id}</code>)\n"
                 f"🆔 Message ID tried: <code>{decode_file_id}</code>\n"
-                f"❌ Error: <code>{e}</code>"
+                f"❌ Error: <code>{html.escape(type(e).__name__ + ': ' + str(e))[:700]}</code>"
             )
-        except:
+        except Exception:
             pass
+        reason = ""
+        if message.from_user.id in ADMINS:  # only admins see the technical reason
+            reason = f"\n\n<code>{html.escape(type(e).__name__ + ': ' + str(e))[:500]}</code>"
         await message.reply_text(
             "<b>❌ This file could not be found or delivered. It may have been removed, or the link is broken. "
-            "Please ask the admin to generate a new link.</b>"
+            "Please ask the admin to generate a new link.</b>" + reason
         )
         
 
@@ -805,24 +780,36 @@ async def cb_handler(client: Client, query: CallbackQuery):
     
     elif query.data == "start":
         buttons = [[
-            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/RudraBlaze'),
-            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/ChillFlizX')
+            InlineKeyboardButton('👨‍💻 ᴍᴀɪɴᴛᴀɪɴᴇʀ', url='https://t.me/Mimam_Officialx'),
+            InlineKeyboardButton('📢 ᴜᴘᴅᴀᴛᴇ ᴄʜᴀɴɴᴇʟ', url='https://t.me/Mrn_Officialx')
             ],[
-            InlineKeyboardButton('💁‍♂️ ʜᴇʟᴘ', callback_data='help'),
+            InlineKeyboardButton('💁‍♂ ʜᴇʟᴘ', callback_data='help'),
             InlineKeyboardButton('💎 ᴀʙᴏᴜᴛ', callback_data='about')
         ]]
         reply_markup = InlineKeyboardMarkup(buttons)
-        await client.edit_message_media(
-            query.message.chat.id, 
-            query.message.id, 
-            InputMediaPhoto(random.choice(PICS))
-        )
+        settings = await get_settings()
         me2 = (await client.get_me()).mention
-        await query.message.edit_text(
-            text=script.START_TXT.format(query.from_user.mention, me2),
-            reply_markup=reply_markup,
-            parse_mode=enums.ParseMode.HTML
-        )
+        start_caption = settings.get("start_message") or script.START_TXT
+        try:
+            start_caption = start_caption.format(query.from_user.mention, me2)
+        except (IndexError, KeyError):
+            pass
+        start_photo = settings.get("start_photo") or random.choice(PICS)
+        try:
+            await client.edit_message_media(
+                query.message.chat.id,
+                query.message.id,
+                InputMediaPhoto(start_photo, caption=start_caption, parse_mode=enums.ParseMode.HTML),
+            )
+            await query.message.edit_reply_markup(reply_markup=reply_markup)
+        except Exception:
+            # bad/expired custom start_photo file_id -> fall back to default pic
+            await client.edit_message_media(
+                query.message.chat.id,
+                query.message.id,
+                InputMediaPhoto(random.choice(PICS), caption=start_caption, parse_mode=enums.ParseMode.HTML),
+            )
+            await query.message.edit_reply_markup(reply_markup=reply_markup)
 
     
     elif query.data == "help":
