@@ -1,3 +1,12 @@
+# uvloop = faster event loop (much lower CPU with thousands of open connections).
+# MUST be installed before pyrogram is imported. Optional: if the package is
+# missing the bot just runs on the normal asyncio loop.
+try:
+    import uvloop
+    uvloop.install()
+except Exception:
+    pass
+
 import asyncio
 import logging
 import logging.config
@@ -16,6 +25,7 @@ from config import LOG_CHANNEL, PORT
 from Script import script
 from TechVJ.bot import StreamBot
 from TechVJ.server import web_server
+from TechVJ.server.streamer import start_helper_clients
 from TechVJ.utils.keepalive import ping_server
 from TechVJ.utils.watchdog import run_watchdog, mark_ok
 from plugins.dbusers import db
@@ -48,10 +58,18 @@ async def start():
     # check waits for "/" to respond - if the LOG_CHANNEL message crashed the
     # old code before the server ever came up, the health check would never
     # succeed and the platform could end up in a restart loop.
-    app = web.AppRunner(await web_server())
+    # handler_cancellation: when a user closes the tab / cancels the download, the
+    # stream is stopped immediately (frees its Telegram requests + RAM) instead of
+    # running on until the next failed write.
+    # backlog: the default (128) drops connections when thousands of users click at once.
+    app = web.AppRunner(await web_server(), handler_cancellation=True)
     await app.setup()
     bind_address = "0.0.0.0"
-    await web.TCPSite(app, bind_address, PORT).start()
+    await web.TCPSite(app, bind_address, PORT, backlog=2048).start()
+
+    # Optional extra bot tokens (MULTI_TOKEN1, MULTI_TOKEN2 ...) used ONLY for streaming.
+    # Does nothing when no such variable is set.
+    asyncio.create_task(start_helper_clients())
 
     # Re-arm auto-deletes that were still pending when the bot last stopped
     try:
