@@ -35,38 +35,75 @@ import mimetypes
 import os
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
 from aiohttp import web
 from pyrogram import raw, utils
-from pyrogram.errors import AuthBytesInvalid
+from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FileReferenceInvalid, FloodWait
 from pyrogram.file_id import FileId
 from pyrogram.session import Auth, Session
 
-from config import BOT_TOKEN, STREAM_LINK_TTL, URL
+from config import API_HASH, API_ID, BOT_TOKEN, STREAM_LINK_TTL, URL
 
 logger = logging.getLogger(__name__)
 
 MEDIA_TYPES = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
 CHUNK_SIZE = 1024 * 1024  # 1 MiB, must stay a multiple of 4096 (Telegram requirement)
 
-# Download speed: instead of asking Telegram for ONE 1 MiB chunk and waiting for
-# it before asking for the next (speed = 1 MiB / round-trip time), several
-# chunks are requested ahead of time, so the connection stays full.
-#   STREAM_PREFETCH      chunks kept in flight per download (RAM ~= this x 1 MiB)
-#   STREAM_MAX_INFLIGHT  cap on simultaneous Telegram requests across ALL downloads
-STREAM_PREFETCH = max(1, int(os.environ.get("STREAM_PREFETCH", "5") or 5))
-STREAM_MAX_INFLIGHT = max(1, int(os.environ.get("STREAM_MAX_INFLIGHT", "32") or 32))
-_inflight_sem = None
+# ---------------------------------------------------------------------------
+# Tuning (all overridable from the host's environment variables)
+#
+#   STREAM_PREFETCH         chunks kept in flight per DOWNLOAD   (RAM ~= this x 1 MiB per stream)
+#   STREAM_PREFETCH_INLINE  chunks kept in flight per WATCH/seek request (players need little)
+#   STREAM_MAX_INFLIGHT     cap on simultaneous Telegram requests across ALL streams (per bot)
+#   STREAM_SESSIONS_PER_DC  parallel Telegram connections per data-center (per bot).
+#                           ONE connection was the real bottleneck with many users.
+#   STREAM_MAX_ACTIVE       streams served at the same moment. Extra users WAIT in a queue
+#                           (instead of everybody crawling / timing out together).
+#   STREAM_MAX_QUEUE        how many users may wait; beyond that they get a quick 503 + Retry-After
+#   STREAM_QUEUE_WAIT       seconds a user may wait in the queue before getting 503
+#   STREAM_CACHE_TTL        seconds a file's Telegram reference is trusted before re-fetching
+#   MULTI_TOKEN1, MULTI_TOKEN2 ...  OPTIONAL extra bot tokens = extra Telegram bandwidth
+#                           (each must be admin in LOG_CHANNEL; they only stream, never reply)
+# ---------------------------------------------------------------------------
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
 
 
-def _get_inflight_sem():
-    global _inflight_sem
-    if _inflight_sem is None:  # created lazily: needs the running event loop
-        _inflight_sem = asyncio.Semaphore(STREAM_MAX_INFLIGHT)
-    return _inflight_sem
+STREAM_PREFETCH = _env_int("STREAM_PREFETCH", 3, 1)
+STREAM_PREFETCH_INLINE = _env_int("STREAM_PREFETCH_INLINE", 2, 1)
+STREAM_MAX_INFLIGHT = _env_int("STREAM_MAX_INFLIGHT", 64, 1)
+STREAM_SESSIONS_PER_DC = _env_int("STREAM_SESSIONS_PER_DC", 4, 1)
+STREAM_MAX_ACTIVE = _env_int("STREAM_MAX_ACTIVE", 100, 1)
+STREAM_MAX_QUEUE = _env_int("STREAM_MAX_QUEUE", 1000, 0)
+STREAM_QUEUE_WAIT = _env_int("STREAM_QUEUE_WAIT", 25, 1)
+FILE_CACHE_TTL = _env_int("STREAM_CACHE_TTL", 1800, 60)
+FILE_CACHE_MAX = 3000
+NEGATIVE_CACHE_TTL = 600  # helper bot that cannot see a channel is skipped for this long
+
+_inflight_sems = {}
+_active_sem = None
+_queue_len = 0
+
+
+def _get_inflight_sem(owner) -> asyncio.Semaphore:
+    sem = _inflight_sems.get(id(owner))
+    if sem is None:  # created lazily: needs the running event loop
+        sem = _inflight_sems[id(owner)] = asyncio.Semaphore(STREAM_MAX_INFLIGHT)
+    return sem
+
+
+def _get_active_sem() -> asyncio.Semaphore:
+    global _active_sem
+    if _active_sem is None:
+        _active_sem = asyncio.Semaphore(STREAM_MAX_ACTIVE)
+    return _active_sem
 
 
 class StreamFileNotFound(Exception):
@@ -211,85 +248,169 @@ def humanbytes(size) -> str:
 
 
 class ByteStreamer:
-    """Holds cached FileId properties for a single Pyrogram client and
-    yields raw media bytes straight from Telegram's DC servers."""
+    """Streams raw media bytes straight from Telegram's DC servers for ONE
+    Pyrogram client. Holds: a cache of file properties (with expiry), and a
+    POOL of parallel media sessions per data-center."""
 
-    def __init__(self, client):
+    def __init__(self, client, name: str = "main"):
         self.client = client
-        self.cached_file_ids: Dict[Tuple[int, int], FileId] = {}
+        self.name = name
+        self.active = 0                                   # streams currently served by this bot
+        self._cache: "OrderedDict[Tuple[int, int], Tuple[FileId, float]]" = OrderedDict()
+        self._pending: Dict[Tuple[int, int], asyncio.Task] = {}   # de-duplicates simultaneous fetches
+        self._negative: Dict[Tuple[int, int], float] = {}
+        self._pools: Dict[int, list] = {}
+        self._pool_locks: Dict[int, asyncio.Lock] = {}
+        self._load: Dict[int, int] = {}                   # id(session) -> requests in flight
+        self._last_drop: Dict[int, float] = {}
 
-    async def get_file_properties(self, chat_id: int, message_id: int) -> FileId:
+    # ------------------------------------------------------------ file info
+    async def get_file_properties(self, chat_id: int, message_id: int, force: bool = False) -> FileId:
         key = (chat_id, message_id)
-        cached = self.cached_file_ids.get(key)
-        if cached is not None:
-            return cached
-        return await self._generate_file_properties(chat_id, message_id)
+        now = time.time()
+        if not force:
+            cached = self._cache.get(key)
+            if cached is not None and now - cached[1] < FILE_CACHE_TTL:
+                self._cache.move_to_end(key)
+                return cached[0]
+            bad = self._negative.get(key)
+            if bad is not None and now - bad < NEGATIVE_CACHE_TTL:
+                raise StreamFileNotFound
+
+        # Thousands of users opening the SAME link at once used to each call
+        # get_messages() -> FloodWait. Now they all share one single fetch.
+        task = self._pending.get(key)
+        if task is None:
+            task = asyncio.create_task(self._generate_file_properties(chat_id, message_id))
+            self._pending[key] = task
+
+            def _done(t, _key=key):
+                self._pending.pop(_key, None)
+                if not t.cancelled():
+                    t.exception()  # mark retrieved, avoids "never retrieved" log spam
+
+            task.add_done_callback(_done)
+        return await asyncio.shield(task)
 
     async def _generate_file_properties(self, chat_id: int, message_id: int) -> FileId:
-        message = await self.client.get_messages(chat_id, message_id)
+        key = (chat_id, message_id)
+        try:
+            message = await self.client.get_messages(chat_id, message_id)
+        except FloodWait as e:
+            await asyncio.sleep(min(e.value, 20))
+            message = await self.client.get_messages(chat_id, message_id)
+        except Exception:
+            if self.name == "main":
+                raise                      # transient error: let the caller see it, never cache it
+            self._negative[key] = time.time()   # helper bot not in that channel -> skip it for a while
+            raise StreamFileNotFound
         if not message or message.empty:
+            if self.name != "main":
+                self._negative[key] = time.time()
             raise StreamFileNotFound
         media = get_media_from_message(message)
         if not media:
+            if self.name != "main":
+                self._negative[key] = time.time()
             raise StreamFileNotFound
         file_id = FileId.decode(media.file_id)
         file_id.file_size = getattr(media, "file_size", 0) or 0
         file_id.mime_type = getattr(media, "mime_type", "") or ""
         file_id.file_name = getattr(media, "file_name", "") or ""
         file_id.unique_id = getattr(media, "file_unique_id", "") or ""
-        self.cached_file_ids[(chat_id, message_id)] = file_id
+        self._cache[key] = (file_id, time.time())
+        self._cache.move_to_end(key)
+        self._negative.pop(key, None)
+        while len(self._cache) > FILE_CACHE_MAX:
+            self._cache.popitem(last=False)
+        if len(self._negative) > 2000:
+            self._negative.clear()
         return file_id
 
+    # ------------------------------------------------------- session pool
     async def generate_media_session(self, file_id: FileId) -> Session:
-        client = self.client
-        media_session = client.media_sessions.get(file_id.dc_id, None)
-        if media_session is not None:
-            return media_session
-        # Two first-time requests used to both build a session (one leaked).
-        locks = self.__dict__.setdefault("_session_locks", {})
-        async with locks.setdefault(file_id.dc_id, asyncio.Lock()):
-            media_session = client.media_sessions.get(file_id.dc_id, None)
-            if media_session is not None:  # someone else built it while we waited
-                return media_session
-            return await self._create_media_session(file_id)
+        """Returns the least-busy media session for this file's DC, building
+        the pool the first time that DC is needed."""
+        dc_id = file_id.dc_id
+        pool = self._pools.get(dc_id)
+        if not pool:
+            lock = self._pool_locks.setdefault(dc_id, asyncio.Lock())
+            async with lock:
+                pool = self._pools.get(dc_id)
+                if not pool:
+                    pool = await self._build_pool(dc_id)
+        return min(pool, key=lambda s: self._load.get(id(s), 0))
 
-    async def _create_media_session(self, file_id: FileId) -> Session:
+    async def _build_pool(self, dc_id: int) -> list:
         client = self.client
-        media_session = client.media_sessions.get(file_id.dc_id, None)
-        if media_session is not None:
-            return media_session
+        test_mode = await client.storage.test_mode()
+        home_dc = await client.storage.dc_id()
 
-        if file_id.dc_id != await client.storage.dc_id():
-            media_session = Session(
-                client, file_id.dc_id,
-                await Auth(client, file_id.dc_id, await client.storage.test_mode()).create(),
-                await client.storage.test_mode(), is_media=True,
-            )
-            await media_session.start()
+        if dc_id != home_dc:
+            auth_key = await Auth(client, dc_id, test_mode).create()
+        else:
+            auth_key = await client.storage.auth_key()
+
+        first = Session(client, dc_id, auth_key, test_mode, is_media=True)
+        await first.start()
+        if dc_id != home_dc:
             for _ in range(6):
-                exported_auth = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=file_id.dc_id))
+                exported = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 try:
-                    await media_session.send(
-                        raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes)
-                    )
+                    await first.send(raw.functions.auth.ImportAuthorization(id=exported.id, bytes=exported.bytes))
                     break
                 except AuthBytesInvalid:
                     continue
             else:
-                await media_session.stop()
+                await first.stop()
                 raise AuthBytesInvalid
-        else:
-            media_session = Session(
-                client, file_id.dc_id, await client.storage.auth_key(),
-                await client.storage.test_mode(), is_media=True,
-            )
-            await media_session.start()
 
-        client.media_sessions[file_id.dc_id] = media_session
-        return media_session
+        pool = [first]
+        self._pools[dc_id] = pool
+        client.media_sessions.setdefault(dc_id, first)  # Pyrogram's own download_media can reuse it
+
+        async def _grow():
+            # extra parallel connections are added in the background so the
+            # FIRST user never waits for them. Same auth key -> no re-import needed.
+            for _ in range(STREAM_SESSIONS_PER_DC - 1):
+                try:
+                    extra = Session(client, dc_id, auth_key, test_mode, is_media=True)
+                    await extra.start()
+                    if self._pools.get(dc_id) is not pool:   # pool was dropped meanwhile
+                        await extra.stop()
+                        return
+                    pool.append(extra)
+                except Exception as e:
+                    logger.warning(f"[{self.name}] could not add media session for DC{dc_id}: {e}")
+                    return
+
+        asyncio.create_task(_grow())
+        return pool
+
+    def _drop_pool(self, dc_id: int):
+        """A DC's connections look dead -> throw the pool away; it is rebuilt on the next request."""
+        now = time.time()
+        if now - self._last_drop.get(dc_id, 0) < 30:
+            return
+        self._last_drop[dc_id] = now
+        pool = self._pools.pop(dc_id, None)
+        if not pool:
+            return
+        if self.client.media_sessions.get(dc_id) in pool:
+            self.client.media_sessions.pop(dc_id, None)
+        logger.warning(f"[{self.name}] dropping {len(pool)} media session(s) of DC{dc_id}, will rebuild")
+
+        async def _stop_all():
+            for s in pool:
+                try:
+                    await s.stop()
+                except Exception:
+                    pass
+
+        asyncio.create_task(_stop_all())
 
     @staticmethod
-    async def get_location(file_id: FileId):
+    def get_location(file_id: FileId):
         return raw.types.InputDocumentFileLocation(
             id=file_id.media_id,
             access_hash=file_id.access_hash,
@@ -297,25 +418,58 @@ class ByteStreamer:
             thumb_size=file_id.thumbnail_size,
         )
 
-    async def yield_file(self, file_id, offset, first_part_cut, last_part_cut, part_count, chunk_size):
-        media_session = await self.generate_media_session(file_id)
-        location = await self.get_location(file_id)
-        sem = _get_inflight_sem()
+    # ------------------------------------------------------------ streaming
+    async def yield_file(self, key, file_id, offset, first_part_cut, last_part_cut, part_count,
+                         chunk_size, prefetch=None):
+        prefetch = prefetch or STREAM_PREFETCH
+        sem = _get_inflight_sem(self)
         part_count = max(1, part_count)  # a 1-byte range gave 0 before
+        state = {"fid": file_id, "loc": self.get_location(file_id)}
+
+        async def refresh(failed_fid):
+            # Telegram file references expire after a while. Only the first
+            # failing chunk refreshes; the others just reuse the new one.
+            if state["fid"] is not failed_fid:
+                return
+            new_fid = await self.get_file_properties(key[0], key[1], force=True)
+            state["fid"], state["loc"] = new_fid, self.get_location(new_fid)
 
         async def fetch(index):
-            async with sem:
-                r = await media_session.send(
-                    raw.functions.upload.GetFile(location=location, offset=offset + index * chunk_size, limit=chunk_size)
-                )
-            return r.bytes if isinstance(r, raw.types.upload.File) else b""
+            last_exc = None
+            for attempt in range(4):
+                fid = state["fid"]
+                session = await self.generate_media_session(fid)
+                sid = id(session)
+                self._load[sid] = self._load.get(sid, 0) + 1
+                try:
+                    async with sem:
+                        r = await session.send(
+                            raw.functions.upload.GetFile(
+                                location=state["loc"], offset=offset + index * chunk_size, limit=chunk_size
+                            )
+                        )
+                    return r.bytes if isinstance(r, raw.types.upload.File) else b""
+                except FloodWait as e:
+                    last_exc = e
+                    await asyncio.sleep(min(e.value, 20))
+                except (FileReferenceExpired, FileReferenceInvalid) as e:
+                    last_exc = e
+                    await refresh(fid)
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError, AttributeError) as e:
+                    last_exc = e
+                    if attempt >= 2:
+                        self._drop_pool(fid.dc_id)
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                finally:
+                    self._load[sid] = max(0, self._load.get(sid, 1) - 1)
+            raise last_exc
 
         pending = deque()
         next_index = 0
 
         def refill():
             nonlocal next_index
-            while next_index < part_count and len(pending) < STREAM_PREFETCH:
+            while next_index < part_count and len(pending) < prefetch:
                 pending.append(asyncio.create_task(fetch(next_index)))
                 next_index += 1
 
@@ -350,40 +504,136 @@ class ByteStreamer:
 # it needs a running asyncio loop and this module is imported before the bot
 # actually starts polling/idling.
 _streamer: Optional[ByteStreamer] = None
+_helper_streamers: list = []
 
 
 def get_streamer() -> ByteStreamer:
     global _streamer
     if _streamer is None:
         from TechVJ.bot import StreamBot  # local import: avoids any import-order surprises
-        _streamer = ByteStreamer(StreamBot)
+        _streamer = ByteStreamer(StreamBot, "main")
     return _streamer
+
+
+def _helper_tokens() -> list:
+    tokens = []
+    for k, v in sorted(os.environ.items()):
+        if k.startswith("MULTI_TOKEN") and v.strip():
+            tokens.extend(t for t in v.split() if t not in tokens and t != BOT_TOKEN)
+    return tokens
+
+
+async def start_helper_clients():
+    """OPTIONAL: start extra bot tokens (MULTI_TOKEN1, MULTI_TOKEN2 ...) that
+    ONLY stream files. Every extra token = its own Telegram connections and its
+    own rate limits, which is how a single deployment serves thousands of users.
+    The helper bots must be ADMIN in LOG_CHANNEL (and in any batch source
+    channel they should serve - otherwise that file is simply served by the
+    main bot). Safe to call when no tokens are set: does nothing."""
+    from pyrogram import Client
+    for i, token in enumerate(_helper_tokens(), start=1):
+        try:
+            helper = Client(
+                f"stream_helper_{i}", api_id=API_ID, api_hash=API_HASH, bot_token=token,
+                in_memory=True, no_updates=True, workers=1, sleep_threshold=30,
+            )
+            await helper.start()
+            _helper_streamers.append(ByteStreamer(helper, f"helper{i}"))
+            logger.info(f"[STREAM] helper bot #{i} (@{helper.me.username}) ready")
+        except Exception as e:
+            logger.error(f"[STREAM] helper bot #{i} failed to start, ignoring it: {type(e).__name__}: {e}")
+
+
+async def _select_streamer(chat_id: int, message_id: int):
+    """Least-busy bot that can actually see this file. Falls back to the main
+    bot, so a helper that is missing from a channel never breaks a link."""
+    candidates = sorted([get_streamer()] + _helper_streamers, key=lambda x: x.active)
+    first_error = None
+    for st in candidates:
+        try:
+            return st, await st.get_file_properties(chat_id, message_id)
+        except StreamFileNotFound:
+            if st.name == "main":
+                raise            # the main bot sees every file; if it can't find it, it's gone
+        except Exception as e:
+            first_error = first_error or e
+            logger.warning(f"[STREAM] {st.name} could not load file info: {type(e).__name__}: {e}")
+    if first_error is not None:
+        raise first_error
+    raise StreamFileNotFound
+
+
+def _parse_range(header: str, file_size: int):
+    """Returns (from_bytes, until_bytes) or None if not satisfiable. Supports
+    'a-b', 'a-' and the suffix form '-n' (last n bytes); the end is clamped to the
+    file size as the HTTP spec says. Multiple ranges: only the first is served."""
+    try:
+        spec = header.replace("bytes=", "").split(",")[0].strip()
+        start_s, _, end_s = spec.partition("-")
+        if start_s == "":
+            n = int(end_s)
+            if n <= 0:
+                return None
+            return max(file_size - n, 0), file_size - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    end = min(end, file_size - 1)
+    if start < 0 or start >= file_size or end < start:
+        return None
+    return start, end
+
+
+def _content_disposition(disposition: str, file_name: str) -> str:
+    clean = "".join(c for c in (file_name or "file") if c >= " " and c not in '"\\\x7f')
+    ascii_name = clean.encode("ascii", "ignore").decode() or "file"
+    return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(clean)}"
+
+
+async def _acquire_stream_slot():
+    """Wait (bounded) for one of the STREAM_MAX_ACTIVE slots. With 20k users, letting
+    everybody stream at once makes EVERY stream crawl and time out; a short queue
+    keeps each served user fast, and the rest just wait a few seconds."""
+    global _queue_len
+    sem = _get_active_sem()
+    if not sem.locked():
+        await sem.acquire()
+        return
+    if _queue_len >= STREAM_MAX_QUEUE:
+        raise web.HTTPServiceUnavailable(text="Server is busy, please retry in a few seconds.",
+                                         headers={"Retry-After": "5"})
+    _queue_len += 1
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=STREAM_QUEUE_WAIT)
+    except asyncio.TimeoutError:
+        raise web.HTTPServiceUnavailable(text="Server is busy, please retry in a few seconds.",
+                                         headers={"Retry-After": "5"})
+    finally:
+        _queue_len -= 1
 
 
 async def stream_media(request: web.Request, chat_id: int, message_id: int) -> web.Response:
     # NOTE: the link's signature + expiry must already be verified by the
     # caller (via resolve_stream_token) before this is ever called - no
     # authorization check happens here, only the actual byte streaming.
-    streamer = get_streamer()
-    file_id = await streamer.get_file_properties(chat_id, message_id)
+    streamer, file_id = await _select_streamer(chat_id, message_id)
 
     file_size = file_id.file_size
     range_header = request.headers.get("Range")
     if range_header:
-        from_bytes, _, until_bytes = range_header.replace("bytes=", "").partition("-")
-        from_bytes = int(from_bytes) if from_bytes else 0
-        until_bytes = int(until_bytes) if until_bytes else file_size - 1
+        parsed = _parse_range(range_header, file_size)
+        if parsed is None:
+            return web.Response(
+                status=416, body=b"416: Range not satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        from_bytes, until_bytes = parsed
     else:
-        from_bytes = 0
-        until_bytes = file_size - 1
+        if file_size <= 0:
+            raise web.HTTPNotFound(text=StreamFileNotFound.message)
+        from_bytes, until_bytes = 0, file_size - 1
 
-    if (until_bytes >= file_size) or (from_bytes < 0) or (until_bytes < from_bytes):
-        return web.Response(
-            status=416, body=b"416: Range not satisfiable",
-            headers={"Content-Range": f"bytes */{file_size}"},
-        )
-
-    until_bytes = min(until_bytes, file_size - 1)
     offset = from_bytes - (from_bytes % CHUNK_SIZE)
     first_part_cut = from_bytes - offset
     last_part_cut = until_bytes % CHUNK_SIZE + 1
@@ -395,50 +645,71 @@ async def stream_media(request: web.Request, chat_id: int, message_id: int) -> w
 
     mime_type = file_id.mime_type or (mimetypes.guess_type(file_id.file_name or "")[0]) or "application/octet-stream"
     file_name = file_id.file_name or "file"
-    disposition = "attachment" if request.rel_url.query.get("dl") == "1" else "inline"
+    is_download = request.rel_url.query.get("dl") == "1"
+    disposition = "attachment" if is_download else "inline"
 
-    # Build the Telegram media session BEFORE the headers go out, so a failure
-    # here is a normal HTTP error and not a half-sent 200.
-    await streamer.generate_media_session(file_id)
+    headers = {
+        "Content-Type": mime_type,
+        "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
+        "Content-Length": str(req_length),
+        "Content-Disposition": _content_disposition(disposition, file_name),
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+    }
 
-    resp = web.StreamResponse(
-        status=206 if range_header else 200,
-        headers={
-            "Content-Type": mime_type,
-            "Content-Range": f"bytes {from_bytes}-{until_bytes}/{file_size}",
-            "Content-Length": str(req_length),
-            "Content-Disposition": f'{disposition}; filename="{file_name}"',
-            "Accept-Ranges": "bytes",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-            "Access-Control-Allow-Headers": "Range, Content-Type",
-            "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
-        },
-    )
-    await resp.prepare(request)
     if request.method == "HEAD":
+        resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
+        await resp.prepare(request)
         return resp
 
-    body = streamer.yield_file(file_id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE)
-    sent = 0
+    await _acquire_stream_slot()          # may raise 503 (queue full / waited too long)
+    streamer.active += 1
+    body = None
     try:
-        async for chunk in body:
-            await resp.write(chunk)
-            sent += len(chunk)
-        if sent < req_length:
-            # Telegram stopped early (timeout). Drop the connection so the client
-            # sees an error and can resume - otherwise it would wait forever for
-            # the missing bytes.
-            logger.warning(f"stream ended early: sent {sent} of {req_length} bytes")
+        # Build the Telegram media session BEFORE the headers go out, so a failure
+        # here is a normal HTTP error and not a half-sent 200.
+        await streamer.generate_media_session(file_id)
+
+        resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
+        await resp.prepare(request)
+
+        body = streamer.yield_file(
+            (chat_id, message_id), file_id, offset, first_part_cut, last_part_cut, part_count, CHUNK_SIZE,
+            prefetch=STREAM_PREFETCH if is_download else STREAM_PREFETCH_INLINE,
+        )
+        sent = 0
+        try:
+            async for chunk in body:
+                await resp.write(chunk)
+                sent += len(chunk)
+            if sent < req_length:
+                # Telegram stopped early (timeout). Drop the connection so the client
+                # sees an error and can resume - otherwise it would wait forever for
+                # the missing bytes.
+                logger.warning(f"stream ended early: sent {sent} of {req_length} bytes")
+                if request.transport is not None:
+                    request.transport.close()
+            else:
+                await resp.write_eof()
+        except (ConnectionResetError, ConnectionError):
+            pass  # the client went away; the finally below stops the prefetching
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # Telegram side failed after the headers were sent: cut the connection so
+            # the client / download manager sees an error and resumes with a Range request.
+            logger.warning(f"stream aborted after {sent}/{req_length} bytes: {type(e).__name__}: {e}")
             if request.transport is not None:
                 request.transport.close()
-        else:
-            await resp.write_eof()
-    except (ConnectionResetError, ConnectionError):
-        pass  # the client went away; the finally below stops the prefetching
+        return resp
     finally:
-        await body.aclose()
-    return resp
+        if body is not None:
+            await body.aclose()
+        streamer.active -= 1
+        _get_active_sem().release()
 
 
 _WATCH_PAGE = r"""<!DOCTYPE html>
@@ -453,8 +724,9 @@ _WATCH_PAGE = r"""<!DOCTYPE html>
 
 <link rel="icon" href="https://files.catbox.moe/idl5a5.png" type="image/jpeg">
 
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -904,18 +1176,27 @@ class Particle{
 
 function init(){
   particles = [];
-  for(let i=0;i<80;i++){
+  for(let i=0;i<(window.innerWidth<700?25:60);i++){
     particles.push(new Particle());
   }
 }
 
+let animating = true;
 function animate(){
+  if(!animating) return;
   ctx.clearRect(0,0,w,h);
   particles.forEach(p=>{
     p.update();
     p.draw();
   });
   requestAnimationFrame(animate);
+}
+// background animation steals CPU from video decoding on cheap phones -> pause while playing
+const vid = document.querySelector("video, audio");
+if(vid){
+  vid.addEventListener("play", ()=>{ animating = false; ctx.clearRect(0,0,w,h); });
+  vid.addEventListener("pause", ()=>{ if(!animating){ animating = true; animate(); } });
+  vid.addEventListener("ended", ()=>{ if(!animating){ animating = true; animate(); } });
 }
 
 window.addEventListener("resize", ()=>{
