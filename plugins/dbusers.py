@@ -1,5 +1,9 @@
+import time
 import motor.motor_asyncio
 from config import DB_NAME, DB_URI
+
+_USER_TTL = 60
+
 
 class Database:
     
@@ -12,6 +16,9 @@ class Database:
         )
         self.db = self._client[database_name]
         self.col = self.db.users
+        # /start (ban check) and every link generation look the user up. Kept in
+        # memory for _USER_TTL seconds; ban/unban/add/delete clear it at once.
+        self._ucache = {}
 
     def new_user(self, id, name):
         return dict(
@@ -22,6 +29,7 @@ class Database:
     async def add_user(self, id, name):
         user = self.new_user(id, name)
         await self.col.insert_one(user)
+        self._ucache.pop(int(id), None)
     
     async def is_user_exist(self, id):
         user = await self.col.find_one({'id':int(id)})
@@ -29,8 +37,19 @@ class Database:
 
     async def get_user(self, id):
         """Single query combining what is_user_exist + is_user_banned used
-        to do as two separate round trips."""
-        return await self.col.find_one({'id': int(id)})
+        to do as two separate round trips. Cached for _USER_TTL seconds."""
+        id = int(id)
+        now = time.monotonic()
+        hit = self._ucache.get(id)
+        if hit is not None and now - hit[1] < _USER_TTL:
+            return dict(hit[0])
+        user = await self.col.find_one({'id': id})
+        if user is not None:            # "not found" is never cached: a new user must be created at once
+            if len(self._ucache) > 30000:
+                self._ucache.clear()
+            self._ucache[id] = (user, now)
+            return dict(user)
+        return None
 
     async def total_users_count(self):
         count = await self.col.count_documents({})
@@ -40,16 +59,22 @@ class Database:
         return self.col.find({})
 
     async def delete_user(self, user_id):
+        self._ucache.pop(int(user_id), None)
         await self.col.delete_many({'id': int(user_id)})
+        self._ucache.pop(int(user_id), None)
 
     async def ban_user(self, user_id):
+        self._ucache.pop(int(user_id), None)
         await self.col.update_one({'id': int(user_id)}, {'$set': {'banned': True}})
+        self._ucache.pop(int(user_id), None)
 
     async def unban_user(self, user_id):
+        self._ucache.pop(int(user_id), None)
         await self.col.update_one({'id': int(user_id)}, {'$set': {'banned': False}})
+        self._ucache.pop(int(user_id), None)
 
     async def is_user_banned(self, user_id):
-        user = await self.col.find_one({'id': int(user_id)})
+        user = await self.get_user(user_id)
         if user:
             return user.get('banned', False)
         return False

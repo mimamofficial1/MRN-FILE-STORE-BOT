@@ -20,6 +20,7 @@ from config import *
 import re
 import json
 import base64
+from collections import OrderedDict
 logger = logging.getLogger(__name__)
 
 BATCH_FILES = {}
@@ -329,10 +330,15 @@ async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer
             try:
                 t0 = time.monotonic()
                 sent = await _copy_one(src, chat_id, kw)
-                if pacer is not None and time.monotonic() - t0 > 1.5:
-                    # Pyrogram silently sleeps through short FloodWaits, so a slow
-                    # copy = Telegram is throttling us -> slow the batch pace down
-                    pacer["delay"] = min(pacer["delay"] * 2, 1.0)
+                if pacer is not None:
+                    took = time.monotonic() - t0
+                    if took > 1.5:
+                        # Pyrogram silently sleeps through short FloodWaits, so a slow
+                        # copy = Telegram is throttling us -> slow the batch pace down
+                        pacer["delay"] = min(pacer["delay"] * 2, 1.0)
+                    elif took < 0.6:
+                        # Telegram is keeping up -> ease back towards full speed
+                        pacer["delay"] = max(pacer["delay"] * 0.85, 0.08)
                 return sent, first_error
             except FloodWait as e:
                 if pacer is not None:
@@ -347,7 +353,7 @@ async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer
     raise last_error
 
 
-async def _get_log_message(client, mid):
+async def _fetch_log_message(client, mid):
     """Fetch a stored message from LOG_CHANNEL. Re-resolves the channel if the
     bot's peer cache is empty (happens after a redeploy) and fails loudly if
     the message is gone, instead of returning an empty Message."""
@@ -361,6 +367,106 @@ async def _get_log_message(client, mid):
     return msg
 
 
+# A popular link is opened by thousands of users: each one used to cost its own
+# get_messages() round trip to Telegram (and flood-wait risk). Now the stored
+# message is kept for _LOGMSG_TTL seconds and simultaneous requests share ONE fetch.
+_LOGMSG_TTL = 300
+_LOGMSG_MAX = 2000
+_logmsg_cache = OrderedDict()   # message id -> (Message, time.monotonic())
+_logmsg_pending = {}            # message id -> running fetch Task
+
+
+async def _get_log_message(client, mid, fresh=False):
+    if fresh:
+        _logmsg_cache.pop(mid, None)
+    else:
+        hit = _logmsg_cache.get(mid)
+        if hit is not None and time.monotonic() - hit[1] < _LOGMSG_TTL:
+            return hit[0]
+    task = _logmsg_pending.get(mid)
+    if task is None:
+        task = asyncio.create_task(_fetch_log_message(client, mid))
+        _logmsg_pending[mid] = task
+
+        def _done(t, _mid=mid):
+            _logmsg_pending.pop(_mid, None)
+            if t.cancelled() or t.exception() is not None:
+                return
+            _logmsg_cache[_mid] = (t.result(), time.monotonic())
+            _logmsg_cache.move_to_end(_mid)
+            while len(_logmsg_cache) > _LOGMSG_MAX:
+                _logmsg_cache.popitem(last=False)
+
+        task.add_done_callback(_done)
+    return await asyncio.shield(task)
+
+
+def _prefetch_log_message(client, data):
+    """Start loading the stored file message NOW, so it is already on its way
+    while the ban / force-sub / verify checks are still running (they used to
+    finish first and only THEN did the fetch begin)."""
+    if data.startswith(("verify-", "BATCH-")):
+        return
+    try:
+        _pre, did = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("ascii").split("_", 1)
+        mid = int(did)
+    except Exception:
+        return
+    t = _spawn(_get_log_message(client, mid))
+    t.add_done_callback(lambda tk: tk.cancelled() or tk.exception())  # never log "exception not retrieved"
+
+
+async def _log_new_user(client, user):
+    try:
+        await client.send_message(LOG_CHANNEL, script.LOG_TEXT.format(user.id, user.mention))
+    except Exception:
+        pass
+
+
+async def _log_single_access(client, user, title, msg):
+    """Admin access log - runs in the background so the user's reminder and the
+    next link are never held up by it."""
+    try:
+        await client.send_message(
+            LOG_CHANNEL,
+            f"<b>📥 #FileAccess</b>\n\n"
+            f"👤 User: {user.mention} (<code>{user.id}</code>)\n"
+            f"🎬 File: <code>{title}</code>"
+        )
+        await _forward_single_to_log(client, msg)
+    except Exception:
+        pass
+
+
+async def _log_batch_access(client, user, titles, delivered, accessed_refs):
+    try:
+        if titles:
+            shown = titles[:30]
+            files_list = "\n".join(f"{i+1}. <code>{t}</code>" for i, t in enumerate(shown))
+            if len(titles) > 30:
+                files_list += f"\n... and {len(titles) - 30} more"
+        else:
+            files_list = "N/A"
+        await client.send_message(
+            LOG_CHANNEL,
+            f"<b>📥 #FileAccess (Batch)</b>\n\n"
+            f"👤 User: {user.mention} (<code>{user.id}</code>)\n"
+            f"📦 Files Accessed: <code>{delivered}</code>\n\n"
+            f"{files_list}\n\n"
+            f"⬇️ ᴀᴄᴛᴜᴀʟ ꜰɪʟᴇꜱ ʙᴇʟᴏᴡ"
+        )
+        await _forward_accessed_to_log(client, accessed_refs)
+    except Exception:
+        pass
+
+
+async def _quiet_delete(m):
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+
 async def _log_warning(client, text):
     try:
         await client.send_message(LOG_CHANNEL, text)
@@ -371,14 +477,17 @@ async def _log_warning(client, text):
 @Client.on_message(filters.command("start") & filters.incoming)
 async def start(client, message):
     username = client.me.username
-    user_doc = await db.get_user(message.from_user.id)
+    # the user lookup and the settings read are independent -> one wait instead of two
+    user_doc, settings = await asyncio.gather(db.get_user(message.from_user.id), get_settings())
     if not user_doc:
         await db.add_user(message.from_user.id, message.from_user.first_name)
-        await client.send_message(LOG_CHANNEL, script.LOG_TEXT.format(message.from_user.id, message.from_user.mention))
+        _spawn(_log_new_user(client, message.from_user))
     elif user_doc.get('banned', False):
         return await message.reply_text("<b>🚫 You are banned from using this bot.</b>")
 
-    settings = await get_settings()
+    if len(message.command) == 2:
+        _prefetch_log_message(client, message.command[1])
+
     missing_channels, fsub_buttons = await get_missing_and_buttons(client, message.from_user.id, settings)
     if missing_channels:
         buttons = fsub_buttons
@@ -531,7 +640,7 @@ async def start(client, message):
                     if r:
                         fetched[(ch, r.id)] = r
 
-        pacer = {"delay": 0.25}  # starts fast; doubles (max 1s) whenever Telegram throttles
+        pacer = {"delay": 0.12}  # starts fast; doubles (max 1s) when Telegram throttles, eases back when it keeps up
         for channel_id, msgid in order:
             info = fetched.get((channel_id, msgid))
             if not info:
@@ -573,29 +682,9 @@ async def start(client, message):
             titles.append(title)
             accessed_refs.append((channel_id, msgid))
             await asyncio.sleep(pacer["delay"])
-        try:
-            if titles:
-                shown = titles[:30]
-                files_list = "\n".join(f"{i+1}. <code>{t}</code>" for i, t in enumerate(shown))
-                if len(titles) > 30:
-                    files_list += f"\n... and {len(titles) - 30} more"
-            else:
-                files_list = "N/A"
-            await client.send_message(
-                LOG_CHANNEL,
-                f"<b>📥 #FileAccess (Batch)</b>\n\n"
-                f"👤 User: {message.from_user.mention} (<code>{message.from_user.id}</code>)\n"
-                f"📦 Files Accessed: <code>{len(filesarr)}</code>\n\n"
-                f"{files_list}\n\n"
-                f"⬇️ ᴀᴄᴛᴜᴀʟ ꜰɪʟᴇꜱ ʙᴇʟᴏᴡ"
-            )
-            # Also forward the real accessed files/videos into the log channel
-            # (not just their names) - runs in the background so it never
-            # slows down the reply the user is waiting for.
-            asyncio.create_task(_forward_accessed_to_log(client, accessed_refs))
-        except:
-            pass
-        await sts.delete()
+        # admin log + forwarding of the real files: background, the user never waits for it
+        _spawn(_log_batch_access(client, message.from_user, titles, len(filesarr), accessed_refs))
+        _spawn(_quiet_delete(sts))
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
             k = await client.send_message(chat_id = message.from_user.id, text=(
@@ -633,8 +722,7 @@ async def start(client, message):
             reply_markup=InlineKeyboardMarkup(btn)
         )
         return
-    try:
-        msg = await _get_log_message(client, int(decode_file_id))
+    async def _deliver_single(msg):
         real_file_types = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
         protect = settings.get("protect_content", False)
         rows = _build_custom_buttons(settings)
@@ -657,6 +745,17 @@ async def start(client, message):
             # text / link / sticker / anything else: send as-is
             title = "Unknown File"
             del_msg, copy_err = await _safe_copy(msg, message.from_user.id, rows=rows, protect=protect)
+        return del_msg, copy_err, title
+
+    try:
+        msg = await _get_log_message(client, int(decode_file_id))
+        try:
+            del_msg, copy_err, title = await _deliver_single(msg)
+        except Exception:
+            # the cached copy of the stored message may carry an expired file
+            # reference -> load it fresh from Telegram and try once more
+            msg = await _get_log_message(client, int(decode_file_id), fresh=True)
+            del_msg, copy_err, title = await _deliver_single(msg)
         if copy_err:
             # file WAS delivered, but only after dropping caption/buttons -> tell admins why
             logger.error(f"Delivered with fallback, first error: {copy_err}")
@@ -666,18 +765,8 @@ async def start(client, message):
                 f"❌ First error: <code>{html.escape(str(copy_err))[:500]}</code>\n\n"
                 f"Check /settings → custom buttons / caption."
             ))
-        try:
-            await client.send_message(
-                LOG_CHANNEL,
-                f"<b>📥 #FileAccess</b>\n\n"
-                f"👤 User: {message.from_user.mention} (<code>{message.from_user.id}</code>)\n"
-                f"🎬 File: <code>{title}</code>"
-            )
-            # Also forward the real accessed file into the log channel (not
-            # just its name), in the background so delivery isn't delayed.
-            asyncio.create_task(_forward_single_to_log(client, msg))
-        except Exception:
-            pass
+        # admin log in the background: the reminder below no longer waits for it
+        _spawn(_log_single_access(client, message.from_user, title, msg))
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
             k = await client.send_message(chat_id = message.from_user.id, text=(

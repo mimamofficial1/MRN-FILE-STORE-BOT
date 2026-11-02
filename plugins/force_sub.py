@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import datetime
+import time
 from pyrogram import Client, filters, enums
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -36,6 +37,13 @@ _verify_semaphore = asyncio.Semaphore(8)
 # quietly *declined* (Telegram sends no event at all for a plain decline,
 # unlike ban/kick which we already detect via handle_member_left below).
 JOIN_REQUEST_TTL_DAYS = 3
+
+# Normal-mode channels: once get_chat_member says "joined", trust it for a few
+# minutes instead of asking Telegram again on EVERY /start (that call was the
+# slowest part of the check, and users open many links in a row). A user who
+# leaves is dropped from this cache straight away by handle_member_left.
+_JOINED_TTL = 300
+_joined_cache = {}   # (user_id, channel_id) -> time.monotonic() of the last successful check
 
 
 @Client.on_chat_join_request()
@@ -78,6 +86,9 @@ async def handle_member_left(client: Client, update):
     bot again."""
     new = update.new_chat_member
     old = update.old_chat_member
+    _u = (new.user if new else None) or (old.user if old else None)
+    if _u:
+        _joined_cache.pop((_u.id, update.chat.id), None)
     logger.info(
         f"[FSUB] member_updated event: chat={update.chat.id} "
         f"old_status={old.status if old else None} new_status={new.status if new else None}"
@@ -136,6 +147,11 @@ async def _channel_status(client: Client, entry, user_id: int, index: int = 1):
     ch = force_sub_channel_id(entry)
     mode = force_sub_channel_mode(entry)
 
+    if mode != "request":
+        ts = _joined_cache.get((user_id, ch))
+        if ts is not None and time.monotonic() - ts < _JOINED_TTL:
+            return None, None   # joined a moment ago - no Telegram call needed
+
     if mode == "request":
         doc = await get_join_request(user_id, ch)
         if doc:
@@ -169,6 +185,10 @@ async def _channel_status(client: Client, entry, user_id: int, index: int = 1):
                     await record_join_request(user_id, ch)
                 except Exception:
                     pass
+            else:
+                if len(_joined_cache) > 50000:
+                    _joined_cache.clear()
+                _joined_cache[(user_id, ch)] = time.monotonic()
             return None, None
     except UserNotParticipant:
         logger.info(f"[FSUB] user={user_id} chat={ch} -> UserNotParticipant")

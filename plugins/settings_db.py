@@ -1,7 +1,9 @@
 # Dynamic bot settings stored in MongoDB so admins can change them
 # from chat (via /settings) without redeploying the bot.
 
+import copy
 import datetime
+import time
 import motor.motor_asyncio
 from config import DB_URI, DB_NAME
 
@@ -40,24 +42,51 @@ DEFAULTS = {
 }
 
 
-async def get_settings():
+# get_settings() is called on EVERY /start, every link generation, every panel
+# click - each call used to be a MongoDB round trip. Now it is served from
+# memory and refreshed every _SETTINGS_TTL seconds; any change made through
+# update_setting() clears the cache immediately, so /settings edits still apply
+# at once. Callers get their own copy, so they can modify it freely.
+_SETTINGS_TTL = 20
+_settings_cache = None
+_settings_cache_ts = 0.0
+_settings_version = 0
+
+
+async def _load_settings():
     doc = await _col.find_one({"_id": "settings"})
     if not doc:
-        doc = DEFAULTS.copy()
-        await _col.insert_one(doc)
+        doc = copy.deepcopy(DEFAULTS)
+        await _col.insert_one(copy.deepcopy(doc))
         return doc
     changed = False
     for k, v in DEFAULTS.items():
         if k not in doc:
-            doc[k] = v
+            doc[k] = copy.deepcopy(v)
             changed = True
     if changed:
         await _col.update_one({"_id": "settings"}, {"$set": doc}, upsert=True)
     return doc
 
 
+async def get_settings():
+    global _settings_cache, _settings_cache_ts
+    if _settings_cache is not None and time.monotonic() - _settings_cache_ts < _SETTINGS_TTL:
+        return copy.deepcopy(_settings_cache)
+    version = _settings_version
+    doc = await _load_settings()
+    if version == _settings_version:   # nobody changed a setting while we were reading
+        _settings_cache, _settings_cache_ts = copy.deepcopy(doc), time.monotonic()
+    return doc
+
+
 async def update_setting(key, value):
+    global _settings_cache, _settings_version
+    _settings_version += 1
+    _settings_cache = None
     await _col.update_one({"_id": "settings"}, {"$set": {key: value}}, upsert=True)
+    _settings_version += 1
+    _settings_cache = None
 
 
 async def touch_last_used():
