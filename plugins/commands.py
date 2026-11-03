@@ -416,6 +416,45 @@ def _prefetch_log_message(client, data):
     t.add_done_callback(lambda tk: tk.cancelled() or tk.exception())  # never log "exception not retrieved"
 
 
+# ---------------------------------------------------------------------------
+# Admin-log queue. Every file access posts to LOG_CHANNEL (a text + a forward). Telegram
+# only lets a bot post ~1 message/second into one chat, so a burst of users used to flood
+# the channel - and /link and /batch write to the SAME channel, so they got stuck behind
+# the flood (FloodWait). Now ALL admin logging goes through ONE paced worker: it can never
+# flood the channel, and if users arrive faster than it can log, the oldest-first backlog
+# is capped and extra log entries are simply skipped. Users and link generation never wait.
+# ---------------------------------------------------------------------------
+_LOG_GAP = 2.0            # seconds between log jobs (each job = 1 text + 1 forward at most)
+_LOG_MAX_BACKLOG = 500    # more waiting than this -> new log entries are skipped
+_log_queue = None
+_log_worker_task = None
+_log_dropped = 0
+
+
+async def _log_worker():
+    while True:
+        fn, args = await _log_queue.get()
+        try:
+            await fn(*args)
+        except Exception:
+            pass
+        await asyncio.sleep(_LOG_GAP)
+
+
+def _log_later(fn, *args):
+    global _log_queue, _log_worker_task, _log_dropped
+    if _log_queue is None:
+        _log_queue = asyncio.Queue()
+    if _log_queue.qsize() >= _LOG_MAX_BACKLOG:
+        _log_dropped += 1
+        if _log_dropped % 100 == 1:
+            logger.warning(f"[LOG] admin-log backlog full ({_LOG_MAX_BACKLOG}); {_log_dropped} entries skipped so far")
+        return
+    _log_queue.put_nowait((fn, args))
+    if _log_worker_task is None or _log_worker_task.done():
+        _log_worker_task = asyncio.create_task(_log_worker())
+
+
 async def _log_new_user(client, user):
     try:
         await client.send_message(LOG_CHANNEL, script.LOG_TEXT.format(user.id, user.mention))
@@ -481,7 +520,7 @@ async def start(client, message):
     user_doc, settings = await asyncio.gather(db.get_user(message.from_user.id), get_settings())
     if not user_doc:
         await db.add_user(message.from_user.id, message.from_user.first_name)
-        _spawn(_log_new_user(client, message.from_user))
+        _log_later(_log_new_user, client, message.from_user)
     elif user_doc.get('banned', False):
         return await message.reply_text("<b>🚫 You are banned from using this bot.</b>")
 
@@ -683,7 +722,7 @@ async def start(client, message):
             accessed_refs.append((channel_id, msgid))
             await asyncio.sleep(pacer["delay"])
         # admin log + forwarding of the real files: background, the user never waits for it
-        _spawn(_log_batch_access(client, message.from_user, titles, len(filesarr), accessed_refs))
+        _log_later(_log_batch_access, client, message.from_user, titles, len(filesarr), accessed_refs)
         _spawn(_quiet_delete(sts))
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
@@ -766,7 +805,7 @@ async def start(client, message):
                 f"Check /settings → custom buttons / caption."
             ))
         # admin log in the background: the reminder below no longer waits for it
-        _spawn(_log_single_access(client, message.from_user, title, msg))
+        _log_later(_log_single_access, client, message.from_user, title, msg)
         if settings.get("auto_delete", True):
             del_minutes = max(1, settings.get("auto_delete_time", 1800) // 60)
             k = await client.send_message(chat_id = message.from_user.id, text=(

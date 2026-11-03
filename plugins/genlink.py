@@ -11,6 +11,11 @@ import re
 import os
 import json
 import base64
+import asyncio
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 
 async def allowed(_, __, message):
@@ -42,15 +47,14 @@ async def batch_allowed(_, __, message):
 
 @Client.on_message((filters.document | filters.video | filters.audio) & filters.private & filters.create(allowed))
 async def incoming_gen_link(bot, message):
-    username = (await bot.get_me()).username
+    username = bot.me.username
     file_type = message.media
-    post = await copy_keep_cover(message, LOG_CHANNEL)
+    user_id = message.from_user.id
+    post, user = await asyncio.gather(copy_keep_cover(message, LOG_CHANNEL), get_user(user_id))
     file_id = str(post.id)
     string = 'file_'
     string += file_id
     outstr = base64.urlsafe_b64encode(string.encode("ascii")).decode().strip("=")
-    user_id = message.from_user.id
-    user = await get_user(user_id)
     if WEBSITE_URL_MODE == True:
         share_link = f"{WEBSITE_URL}?Mrn_Officialx={outstr}"
     else:
@@ -64,18 +68,17 @@ async def incoming_gen_link(bot, message):
 
 @Client.on_message(filters.command(['link']) & filters.create(allowed))
 async def gen_link_s(bot, message):
-    username = (await bot.get_me()).username
+    username = bot.me.username
     replied = message.reply_to_message
     if not replied:
         return await message.reply('Reply to a message to get a shareable link.')
     
-    post = await copy_keep_cover(replied, LOG_CHANNEL)
+    user_id = message.from_user.id
+    post, user = await asyncio.gather(copy_keep_cover(replied, LOG_CHANNEL), get_user(user_id))
     file_id = str(post.id)
     string = f"file_"
     string += file_id
     outstr = base64.urlsafe_b64encode(string.encode("ascii")).decode().strip("=")
-    user_id = message.from_user.id
-    user = await get_user(user_id)
     if WEBSITE_URL_MODE == True:
         share_link = f"{WEBSITE_URL}?Mrn_Officialx={outstr}"
     else:
@@ -111,7 +114,7 @@ def _extract_batch_ref(msg):
 
 @Client.on_message(filters.command(['batch']) & filters.create(batch_allowed))
 async def gen_link_batch(bot, message):
-    username = (await bot.get_me()).username
+    username = bot.me.username
 
     await message.reply(
         "<b>Forward The Batch First Message From your Batch Channel (With Forward Tag).. "
@@ -162,16 +165,21 @@ async def gen_link_batch(bot, message):
 
     outlist = []
 
-
     # file store without db channel
     og_msg = 0
     tot = 0
+    t0 = time.monotonic()
+    last_edit = 0.0
     async for msg in bot.iter_messages(f_chat_id, l_msg_id, f_msg_id):
         tot += 1
-        if og_msg % 20 == 0:
+        # progress: at most one edit every 2 seconds. (Before it edited on EVERY skipped/deleted
+        # message while the counter was still 0 -> hundreds of edits -> FloodWait -> "stuck".)
+        now = time.monotonic()
+        if now - last_edit >= 2.0:
+            last_edit = now
             try:
                 await sts.edit(FRMT.format(total=l_msg_id-f_msg_id, current=tot, rem=((l_msg_id-f_msg_id) - tot), sts="Saving Messages"))
-            except:
+            except Exception:
                 pass
         if msg.empty or msg.service:
             continue
@@ -179,24 +187,37 @@ async def gen_link_batch(bot, message):
             "channel_id": f_chat_id,
             "msg_id": msg.id
         }
-        og_msg +=1
+        og_msg += 1
         outlist.append(file)
+    t1 = time.monotonic()
 
-
-    with open(f"batchmode_{message.from_user.id}.json", "w+") as out:
+    path = f"batchmode_{message.from_user.id}.json"
+    with open(path, "w+") as out:
         json.dump(outlist, out)
-    post = await bot.send_document(LOG_CHANNEL, f"batchmode_{message.from_user.id}.json", file_name="Batch.json", caption="⚠️ Batch Generated For Filestore.")
-    os.remove(f"batchmode_{message.from_user.id}.json")
+    try:
+        # upload the batch file and read the user's shortener settings at the same time
+        post, user = await asyncio.gather(
+            bot.send_document(LOG_CHANNEL, path, file_name="Batch.json", caption="⚠️ Batch Generated For Filestore."),
+            get_user(message.from_user.id),
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    t2 = time.monotonic()
     string = str(post.id)
     file_id = base64.urlsafe_b64encode(string.encode("ascii")).decode().strip("=")
-    user_id = message.from_user.id
-    user = await get_user(user_id)
     if WEBSITE_URL_MODE == True:
         share_link = f"{WEBSITE_URL}?Mrn_Officialx=BATCH-{file_id}"
     else:
         share_link = f"https://t.me/{username}?start=BATCH-{file_id}"
+    short_link = None
     if user["base_site"] and user["shortener_api"] != None:
         short_link = await get_short_link(user, share_link)
+    t3 = time.monotonic()
+    logger.info(f"[BATCH] {og_msg} files | read {t1 - t0:.1f}s | upload {t2 - t1:.1f}s | shortener {t3 - t2:.1f}s")
+    if short_link is not None:
         await sts.edit(f"<b>⭕ ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ:\n\nContains `{og_msg}` files.\n\n🖇️ sʜᴏʀᴛ ʟɪɴᴋ :- {short_link}</b>")
     else:
         await sts.edit(f"<b>⭕ ʜᴇʀᴇ ɪs ʏᴏᴜʀ ʟɪɴᴋ:\n\nContains `{og_msg}` files.\n\n🔗 ᴏʀɪɢɪɴᴀʟ ʟɪɴᴋ :- {share_link}</b>")
