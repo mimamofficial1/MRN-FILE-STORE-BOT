@@ -21,6 +21,8 @@
 #   * any message / forwarded post with premium emoji that an ADMIN sends to the bot in private is learned too.
 # Emoji nobody could be matched with fall back to Telegram's own animated pack (DEFAULT_PACKS below).
 # Text emoji + button icons switch ON by themselves.
+# Telegram limit: premium BUTTON icons are shown only in private/group/supergroup chats. Buttons on channel
+# posts keep their normal emoji (a bot needs an extra username bought on Fragment for more - then set PREMIUM_CHANNEL_BUTTONS=1).
 #
 # Optional: /emojipack <pack link>, /setemoji + premium emoji (hand-mapping, highest priority),
 #           /emoji (status), /emojioff, /emojion, /emojibtn on|off, /emojilist, /delemoji <emoji or all>
@@ -85,6 +87,7 @@ _state = {
     "style_packs": [], # [id, access_hash] of the emoji packs your posts use
     "style": {},       # char -> id from those whole packs
     "sources": {},     # channel id -> newest post id read
+    "broadcast": set(),# broadcast channels (peer ids): Telegram shows NO premium button icons there
     "packs": [],       # extra packs added with /emojipack
     "packs_ok": {},    # pack name -> how many emoji it gave
     "packs_started": False,
@@ -458,6 +461,12 @@ async def _autoload_packs(client):
         ok[name] = len(got)
         for k, v in got.items():
             auto.setdefault(k, v)
+    try:                                             # auto-button channels are broadcast channels by definition
+        from plugins.channel_buttons import _env_ids, _load_enabled
+        for c in set(await _load_enabled()) | set(_env_ids):
+            _mark_broadcast(c)
+    except Exception:
+        pass
     style = {}
     for sid, ah in _state["style_packs"]:                # your own packs, remembered from earlier posts
         try:
@@ -779,6 +788,30 @@ def _style_markup(markup):
 
 
 # --------------------------------------------------------------------------- the hook
+def _channel_post(peer, query) -> bool:
+    """True for posts in a broadcast channel. Telegram only shows premium BUTTON icons for bots in private,
+    group and supergroup chats (or for bots that bought an extra username on Fragment); in a channel it
+    silently ignores the icon - and the emoji we took out of the label would simply be gone. So buttons of
+    channel posts keep their normal emoji. (Set env PREMIUM_CHANNEL_BUTTONS=1 if the bot has a Fragment username.)"""
+    if os.environ.get("PREMIUM_CHANNEL_BUTTONS", "").strip() in ("1", "true", "yes"):
+        return False
+    if not isinstance(peer, raw.types.InputPeerChannel):
+        return False
+    if peer.channel_id in _state["broadcast"]:
+        return True
+    # a markup-only edit of a channel message is what the auto-button feature does to channel posts
+    return (type(query) is raw.functions.messages.EditMessage
+            and getattr(query, "message", None) is None and getattr(query, "media", None) is None)
+
+
+def _mark_broadcast(chat_id):
+    try:
+        if int(chat_id) < -1000000000000:
+            _state["broadcast"].add(get_channel_id(int(chat_id)))
+    except Exception:
+        pass
+
+
 def _skip_peer(peer) -> bool:
     return isinstance(peer, raw.types.InputPeerChannel) and (
         peer.channel_id == _log_channel_id or peer.channel_id in _skip_channels
@@ -868,7 +901,8 @@ async def _invoke(self, query, *args, **kwargs):
                        if type(e) is raw.types.MessageEntityCustomEmoji and id(e) not in old_ids]
                 undo.append(("txt", tgt, "entities", old, ids))
                 tgt.entities = new
-    if _state["btn_on"] and _state["rx"] is not None and getattr(query, "reply_markup", None) is not None:
+    if (_state["btn_on"] and _state["rx"] is not None and getattr(query, "reply_markup", None) is not None
+            and not _channel_post(query.peer, query)):
         new = _style_markup(query.reply_markup)
         if new is not None:
             undo.append(("btn", query, "reply_markup", query.reply_markup, []))
@@ -1157,6 +1191,7 @@ async def emoji_status_cmd(client, message: Message):
 async def learn_from_channel_post(client, message: Message):
     """Every channel post the bot can see: if it holds premium emoji, that is YOUR style - remember it."""
     try:
+        _mark_broadcast(message.chat.id)
         pairs = _pairs_from(message)
         if not pairs or message.chat.id == _log_channel_id_full():
             return

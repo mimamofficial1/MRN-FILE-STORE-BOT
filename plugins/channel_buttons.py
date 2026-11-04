@@ -167,6 +167,17 @@ def _wants_buttons(message) -> bool:
     return bool(message.video or message.document or message.audio)
 
 
+def _needs_repair(message) -> bool:
+    """Our own two buttons on a post, but without their emoji (an earlier version stripped the emoji from
+    the labels of channel buttons). They are rebuilt with the proper labels."""
+    rows = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None)
+    if not rows or message.empty or not (message.video or message.document or message.audio):
+        return False
+    texts = [getattr(b, "text", "") for row in rows for b in row]
+    return (len(texts) == 2 and "ꜰᴀꜱᴛ ᴅᴏᴡɴʟᴏᴀᴅ" in texts[0] and "ᴡᴀᴛᴄʜ ᴏɴʟɪɴᴇ" in texts[1]
+            and not any(e in t for t in texts for e in ("🚀", "🖥")))
+
+
 def _markup_for(message):
     media = get_media_from_message(message)
     if not media:
@@ -210,7 +221,7 @@ async def _scan(client, chat_id, ids):
             if m.empty:
                 continue
             checked += 1
-            if _wants_buttons(m):
+            if _wants_buttons(m) or _needs_repair(m):
                 markup = _markup_for(m)
                 if markup and await _apply_buttons(m, markup):
                     fixed += 1
@@ -267,6 +278,10 @@ async def _startup_catch_up():
         _last[chat_id] = last
         try:
             await _catch_up_channel(StreamBot, chat_id, last)
+            top = _last.get(chat_id, last)
+            _checked, repaired = await _scan(StreamBot, chat_id, range(max(1, top - 59), top + 1))
+            if repaired:
+                logger.info(f"[AUTO-BUTTON] start-up repair: fixed buttons on {repaired} post(s) in {chat_id}")
         except Exception as e:
             logger.error(f"[AUTO-BUTTON] catch-up failed for {chat_id}: {type(e).__name__}: {e}")
 
