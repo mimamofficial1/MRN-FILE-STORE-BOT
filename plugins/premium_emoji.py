@@ -49,9 +49,11 @@ logger = logging.getLogger(__name__)
 
 # Public emoji packs (t.me/addemoji/<name>) used automatically. Earlier = higher priority. Packs that
 # cannot be loaded are skipped; more can be added with /emojipack or the PREMIUM_EMOJI_PACKS env var.
+# Any emoji the bot's code uses that none of the packs has is looked up with Telegram's own emoji search.
 DEFAULT_PACKS = [
-    "AdaptiveIcons", "AdaptivePremium", "Switches_Emoji", "ColorReactions",
-    "TStarsIcons", "AdaptiveLines", "developeremojis",
+    "RestrictedEmoji",     # Telegram's animated "Telemoji": colorful animated versions of the standard emoji
+    "BasicinterfaceEmoji", # colorful animated icons - fills the gaps
+    "AnimatedIconsEmoji",
 ]
 
 MAX_PER_MESSAGE = 80
@@ -157,6 +159,50 @@ async def _fetch_pack(client, name):
     return out
 
 
+_EMOJI_RX = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\u2190-\u21FF\u25A0-\u25FF\U0001F000-\U0001F2FF]")
+
+
+# typography the bot uses that merely lives in the same Unicode blocks: arrows, tick, skin-tone modifiers ...
+_NOT_REAL_EMOJI = re.compile("[\u2190-\u21FF\u2713\u276E\u2642\u2640\u263A\U0001F3FB-\U0001F3FF\u200d]")
+
+
+def _bot_emoji():
+    """Every emoji character that appears in the bot's own source files."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    found = set()
+    for base, _dirs, files in os.walk(root):
+        if any(x in base for x in (".git", "__pycache__", "node_modules")):
+            continue
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            try:
+                with open(os.path.join(base, fn), encoding="utf-8", errors="ignore") as fh:
+                    found.update(_EMOJI_RX.findall(fh.read()))
+            except OSError:
+                pass
+    return found
+
+
+async def _search_missing(client, auto):
+    """For emoji the bot uses but no pack has: ask Telegram's emoji search for a matching premium
+    emoji (best effort - skipped quietly if Telegram does not allow bots to search)."""
+    missing = sorted(e for e in _bot_emoji() if e not in auto and not _NOT_REAL_EMOJI.match(e))
+    found = 0
+    for ch in missing:
+        try:
+            res = await client.invoke(raw.functions.messages.SearchCustomEmoji(emoticon=ch, hash=0), retries=1, timeout=15)
+        except Exception as e:
+            logger.info(f"[premium_emoji] emoji search not available ({type(e).__name__}); "
+                        f"{len(missing) - found} emoji stay normal")
+            return found, missing
+        ids = getattr(res, "document_id", None) or []
+        if ids:
+            auto.setdefault(ch, _s64(ids[0]))
+            found += 1
+    return found, missing
+
+
 async def _autoload_packs(client):
     """Load the packs from Telegram and merge them (earlier pack wins). Runs once per start."""
     if _state["packs_started"]:
@@ -175,8 +221,16 @@ async def _autoload_packs(client):
         ok[name] = len(got)
         for k, v in got.items():
             auto.setdefault(k, v)
+    try:
+        searched, missing = await _search_missing(client, auto)
+    except Exception as e:
+        searched, missing = 0, []
+        logger.warning(f"[premium_emoji] emoji search failed: {type(e).__name__}: {e}")
+    still = sorted(e for e in missing if e not in auto)
     _state["auto"], _state["packs_ok"] = auto, ok
     _rebuild()
+    if still:
+        logger.info(f"[premium_emoji] no premium version found for: {' '.join(still)}")
     logger.info(f"[premium_emoji] {len(auto)} emoji loaded from {len(ok)}/{len(names)} packs "
                 f"({', '.join(f'{n}:{c}' for n, c in ok.items())}); text={'ON' if _state['on'] else 'OFF'} "
                 f"buttons={'ON' if _state['btn_on'] else 'OFF'}")
