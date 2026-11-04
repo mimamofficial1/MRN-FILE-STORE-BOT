@@ -13,15 +13,17 @@
 # inline mode (and channels may refuse - those chats are then skipped automatically; LOG_CHANNEL
 # is always skipped).
 #
-# NOTHING TO SET UP. On every start the bot loads the animated emoji of a few public emoji packs
-# straight from Telegram (DEFAULT_PACKS below), matches each one to the normal emoji it stands for,
-# and switches text emoji + button icons ON by itself. The normal emoji of the bot's texts and
-# buttons are then shown as premium emoji wherever the packs have a match; the rest stay normal.
+# NOTHING TO SET UP. The bot learns YOUR style by itself:
+#   * every post you make in a channel where the bot is a member/admin is read; the premium emoji in it
+#     (and the whole emoji packs they come from) become the bot's emoji too,
+#   * on every start it also reads the last ~200 posts of the channels it knows (auto-button channels,
+#     force-sub channels) so it has your style from the first minute,
+#   * any message / forwarded post with premium emoji that an ADMIN sends to the bot in private is learned too.
+# Emoji nobody could be matched with fall back to Telegram's own animated pack (DEFAULT_PACKS below).
+# Text emoji + button icons switch ON by themselves.
 #
-# Optional (only if you want a different look):
-#   /emojipack <pack link or name>   add another emoji pack (e.g. t.me/addemoji/SomePack)
-#   /setemoji + premium emoji        map single emoji by hand (overrides the packs)
-#   /emoji (status)  /emojioff  /emojion  /emojibtn on|off  /emojilist  /delemoji <emoji or all>
+# Optional: /emojipack <pack link>, /setemoji + premium emoji (hand-mapping, highest priority),
+#           /emoji (status), /emojioff, /emojion, /emojibtn on|off, /emojilist, /delemoji <emoji or all>
 #
 # Safety: if Telegram ever refuses a message because of the emoji / icons (e.g. the owner's Premium
 # expired), the message is re-sent plain at once, and after 3 such failures in a row that feature
@@ -56,6 +58,8 @@ DEFAULT_PACKS = [
     "AnimatedIconsEmoji",
 ]
 
+MAX_STYLE_PACKS = 12
+BACKFILL_POSTS = 200
 MAX_PER_MESSAGE = 80
 MAX_MAPPINGS = 300
 AUTO_OFF_AFTER = 3
@@ -77,6 +81,10 @@ _state = {
     "manual": {},      # emoji you mapped by hand (/setemoji)  - highest priority
     "auto": {},        # emoji found in the packs
     "masked": set(),   # emoji you removed with /delemoji
+    "learned": {},     # char -> {emoji id: times seen} read from YOUR posts
+    "style_packs": [], # [id, access_hash] of the emoji packs your posts use
+    "style": {},       # char -> id from those whole packs
+    "sources": {},     # channel id -> newest post id read
     "packs": [],       # extra packs added with /emojipack
     "packs_ok": {},    # pack name -> how many emoji it gave
     "packs_started": False,
@@ -109,7 +117,12 @@ def _s64(v: int) -> int:
 
 
 def _rebuild():
-    merged = {k: v for k, v in _state["auto"].items() if k not in _state["masked"]}
+    merged = dict(_state["auto"])
+    merged.update(_state["style"])
+    for ch, counts in _state["learned"].items():
+        if counts:
+            merged[ch] = max(counts.items(), key=lambda kv: kv[1])[0]
+    merged = {k: v for k, v in merged.items() if k not in _state["masked"]}
     merged.update(_state["manual"])
     _state["map"] = merged
     keys = sorted(_state["map"], key=len, reverse=True)
@@ -141,9 +154,27 @@ async def _load_state():
             continue
     _state["manual"] = manual
     _state["masked"] = set(st.get("premium_emoji_mask") or [])
+    learned = {}
+    for row in st.get("premium_emoji_learned") or []:
+        try:
+            learned.setdefault(str(row[0]), {})[_s64(row[1])] = int(row[2])
+        except Exception:
+            continue
+    _state["learned"] = learned
+    _state["style_packs"] = [[str(a), str(b)] for a, b in (st.get("premium_emoji_style_packs") or [])]
+    _state["sources"] = {int(c): int(l) for c, l in (st.get("premium_emoji_sources") or [])}
     _state["packs"] = [str(x) for x in (st.get("premium_emoji_packs") or [])]
     _rebuild()
     _state["loaded"] = True
+
+
+def _pack_map(res):
+    out = {}
+    for doc in getattr(res, "documents", None) or []:
+        for attr in doc.attributes:
+            if isinstance(attr, raw.types.DocumentAttributeCustomEmoji) and attr.alt:
+                out.setdefault(attr.alt.replace(_FE0F, "").strip(), _s64(doc.id))
+    return out
 
 
 async def _fetch_pack(client, name):
@@ -152,12 +183,177 @@ async def _fetch_pack(client, name):
         raw.functions.messages.GetStickerSet(stickerset=raw.types.InputStickerSetShortName(short_name=name), hash=0),
         retries=2, timeout=20,
     )
-    out = {}
-    for doc in getattr(res, "documents", None) or []:
-        for attr in doc.attributes:
-            if isinstance(attr, raw.types.DocumentAttributeCustomEmoji) and attr.alt:
-                out.setdefault(attr.alt.replace(_FE0F, "").strip(), _s64(doc.id))
+    return _pack_map(res)
+
+
+async def _fetch_pack_id(client, set_id, access_hash):
+    res = await client.invoke(
+        raw.functions.messages.GetStickerSet(
+            stickerset=raw.types.InputStickerSetID(id=int(set_id), access_hash=int(access_hash)), hash=0),
+        retries=2, timeout=20,
+    )
+    return _pack_map(res)
+
+
+# ---------------------------------------------------------------- learning YOUR style from your posts
+def _pairs_from(m):
+    """[(normal emoji, custom emoji id)] for every premium emoji inside a message / caption."""
+    text = getattr(m, "text", None) or getattr(m, "caption", None) or ""
+    ents = getattr(m, "entities", None) or getattr(m, "caption_entities", None) or []
+    u = str(text).encode("utf-16-le")
+    out = []
+    for e in ents:
+        if e.type != enums.MessageEntityType.CUSTOM_EMOJI or not e.custom_emoji_id:
+            continue
+        ch = u[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le", "ignore").replace(_FE0F, "").strip()
+        if ch:
+            out.append((ch, _s64(e.custom_emoji_id)))
     return out
+
+
+async def _save_style():
+    await update_setting("premium_emoji_learned",
+                         [[k, str(i), n] for k, d in _state["learned"].items() for i, n in d.items()])
+    await update_setting("premium_emoji_style_packs", _state["style_packs"])
+    await update_setting("premium_emoji_sources", [[c, l] for c, l in _state["sources"].items()])
+
+
+async def _expand_style_packs(client, ids):
+    """The emoji ids found in your posts belong to packs; load those WHOLE packs so every emoji of your
+    style is available, not just the ones you happened to use."""
+    if len(_state["style_packs"]) >= MAX_STYLE_PACKS or not ids:
+        return
+    ids, docs = sorted(ids), []
+    try:
+        for i in range(0, len(ids), 100):
+            docs += list(await client.invoke(raw.functions.messages.GetCustomEmojiDocuments(document_id=ids[i:i + 100]),
+                                             retries=1, timeout=20))
+    except Exception as e:
+        logger.info(f"[premium_emoji] could not look up your emoji packs ({type(e).__name__})")
+        return
+    have = {(int(a), int(b)) for a, b in _state["style_packs"]}
+    for d in docs:
+        if not isinstance(d, raw.types.Document):
+            continue
+        for a in d.attributes:
+            if not (isinstance(a, raw.types.DocumentAttributeCustomEmoji)
+                    and isinstance(a.stickerset, raw.types.InputStickerSetID)):
+                continue
+            key = (a.stickerset.id, a.stickerset.access_hash)
+            if key in have or len(_state["style_packs"]) >= MAX_STYLE_PACKS:
+                continue
+            try:
+                pack = await _fetch_pack_id(client, *key)
+            except Exception as e:
+                logger.info(f"[premium_emoji] one of your packs could not be loaded ({type(e).__name__})")
+                continue
+            have.add(key)
+            _state["style_packs"].append([str(key[0]), str(key[1])])
+            for k, v in pack.items():
+                _state["style"].setdefault(k, v)
+            logger.info(f"[premium_emoji] learned one of your emoji packs ({len(pack)} emoji)")
+
+
+async def _learn_pairs(client, pairs, chat=None, last=None):
+    """Remember these premium emoji as YOUR style. Returns how many emoji ids were new."""
+    new_ids, changed = set(), False
+    for ch, did in pairs:
+        ch = ch.replace(_FE0F, "").strip()
+        if not ch or _NOT_REAL_EMOJI.match(ch):
+            continue
+        d = _state["learned"].setdefault(ch, {})
+        if did not in d:
+            new_ids.add(did)
+        d[did] = d.get(did, 0) + 1
+        changed = True
+    if chat is not None and last:
+        _state["sources"][chat] = max(_state["sources"].get(chat, 0), last)
+    if not changed:
+        return 0
+    _rebuild()
+    await _expand_style_packs(client, new_ids)
+    _rebuild()
+    try:
+        await _save_style()
+    except Exception:
+        pass
+    return len(new_ids)
+
+
+async def _exists(client, chat, hi, size=50):
+    msgs = await client.get_messages(chat, list(range(max(1, hi - size + 1), hi + 1)))
+    return [m.id for m in msgs if not m.empty]
+
+
+async def _top_id(client, chat):
+    """Roughly the newest post id of a channel (bots cannot list history, but can ask for ids)."""
+    n = 50
+    if not await _exists(client, chat, n):
+        return 0
+    while n < (1 << 24):          # double until a stretch of 50 ids is completely empty
+        n *= 2
+        if not await _exists(client, chat, n):
+            break
+    lo, hi = n // 2, n            # ids just below `lo` exist, the stretch ending at `hi` is empty
+    while hi - lo > 50:
+        mid = (lo + hi) // 2
+        if await _exists(client, chat, mid):
+            lo = mid
+        else:
+            hi = mid
+    return max(await _exists(client, chat, lo, size=hi - lo + 50) or [0])
+
+
+async def _known_channels():
+    ids = set(_state["sources"])
+    try:
+        from plugins.channel_buttons import _env_ids, _load_enabled
+        ids |= set(await _load_enabled()) | set(_env_ids)
+    except Exception:
+        pass
+    try:
+        from plugins.settings_db import force_sub_channel_id
+        st = await get_settings()
+        for e in st.get("force_sub_channels") or []:
+            cid = force_sub_channel_id(e)
+            if isinstance(cid, int):
+                ids.add(cid)
+    except Exception:
+        pass
+    ids = {c for c in ids if isinstance(c, int) and c < 0 and c != _log_channel_id_full()}
+    return ids
+
+
+def _log_channel_id_full():
+    try:
+        return int(LOG_CHANNEL)
+    except Exception:
+        return None
+
+
+async def _backfill(client):
+    """Read the last posts of the channels the bot knows, so your style is learned right at the start."""
+    total = 0
+    for chat in sorted(await _known_channels()):
+        try:
+            top = await _top_id(client, chat)
+            if not top:
+                continue
+            pairs = []
+            for hi in range(top, max(top - BACKFILL_POSTS, 0), -100):
+                msgs = await client.get_messages(chat, list(range(max(1, hi - 99), hi + 1)))
+                for m in msgs:
+                    if not m.empty:
+                        pairs += _pairs_from(m)
+            if pairs:
+                total += await _learn_pairs(client, pairs, chat, top)
+            else:
+                _state["sources"][chat] = max(_state["sources"].get(chat, 0), top)
+        except Exception as e:
+            logger.info(f"[premium_emoji] could not read channel {chat}: {type(e).__name__}")
+    if total:
+        logger.info(f"[premium_emoji] learned {total} emoji from your channel posts "
+                    f"({len(_state['style_packs'])} of your packs, {len(_state['style'])} emoji in them)")
 
 
 _EMOJI_RX = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\u2190-\u21FF\u25A0-\u25FF\U0001F000-\U0001F2FF]")
@@ -262,6 +458,14 @@ async def _autoload_packs(client):
         ok[name] = len(got)
         for k, v in got.items():
             auto.setdefault(k, v)
+    style = {}
+    for sid, ah in _state["style_packs"]:                # your own packs, remembered from earlier posts
+        try:
+            for k, v in (await _fetch_pack_id(client, sid, ah)).items():
+                style.setdefault(k, v)
+        except Exception as e:
+            logger.info(f"[premium_emoji] saved style pack could not be loaded ({type(e).__name__})")
+    _state["style"] = style
     user = None
     search = "ok"
     try:
@@ -317,6 +521,19 @@ async def _autoload_packs(client):
                 f"text={'ON' if _state['on'] else 'OFF'} buttons={'ON' if _state['btn_on'] else 'OFF'}")
     if still:
         logger.info(f"[premium_emoji] no premium version found for: {' '.join(still)}")
+    _spawn(_backfill_then_report(client))
+
+
+async def _backfill_then_report(client):
+    try:
+        await _backfill(client)
+    except Exception as e:
+        logger.warning(f"[premium_emoji] reading your channels failed: {type(e).__name__}: {e}")
+    real = {e for e in _bot_emoji() if not _NOT_REAL_EMOJI.match(e)}
+    still = sorted(e for e in real if e not in _state["map"])
+    if _state.get("report"):
+        _state["report"].update(covered=len(real) - len(still), missing=still, total=len(real))
+    logger.info(f"[premium_emoji] after learning your style: {len(real) - len(still)}/{len(real)} emoji covered")
 
 
 def _report_text():
@@ -329,6 +546,8 @@ def _report_text():
     ]
     if r["failed"]:
         lines.append("<b>❌ Load nahi hue:</b> " + ", ".join(r["failed"]))
+    lines.append(f"<b>🎨 Tumhara style:</b> {len(_state['learned'])} emoji posts se seekhe, "
+                 f"{len(_state['style_packs'])} packs ({len(_state['style'])} emoji)")
     lines.append(f"<b>🔎 Emoji search:</b> {r['search']}")
     if r["invalid"]:
         lines.append(f"<b>🗑 Galat IDs hataye:</b> {r['invalid']}")
@@ -372,6 +591,7 @@ async def _startup():
         return
     await _load_state()
     await _autoload_packs(StreamBot)
+    await asyncio.sleep(25)                  # let _backfill_then_report finish first
     await _notify_admin(StreamBot)
 
 
@@ -599,9 +819,12 @@ def _forget_bad():
     dead = {i for i, n in _id_bad.items() if n >= ID_STRIKES and _id_ok.get(i, 0) == 0}
     if not dead:
         return
-    for store in ("auto", "manual"):
+    for store in ("auto", "manual", "style"):
         for k in [k for k, v in _state[store].items() if v in dead]:
             del _state[store][k]
+    for ch in list(_state["learned"]):
+        for i in [i for i in _state["learned"][ch] if i in dead]:
+            del _state["learned"][ch][i]
     for i in dead:
         _id_bad.pop(i, None)
     _rebuild()
@@ -900,13 +1123,13 @@ async def del_emoji_cmd(client, message: Message):
     if arg.lower() == "all":
         n = len(_state["map"])
         _state["manual"].clear()
-        _state["masked"] = set(_state["auto"])
+        _state["masked"] = set(_state["auto"]) | set(_state["style"]) | set(_state["learned"])
     else:
         n = 0
         for ch in list(_state["map"]):
             if ch in arg.replace(_FE0F, ""):
                 _state["manual"].pop(ch, None)
-                if ch in _state["auto"]:
+                if ch in _state["auto"] or ch in _state["style"] or ch in _state["learned"]:
                     _state["masked"].add(ch)
                 n += 1
     _rebuild()
@@ -927,3 +1150,38 @@ async def emoji_status_cmd(client, message: Message):
         "<code>/emojipack</code> · <code>/setemoji</code> · <code>/delemoji</code> · <code>/emojion</code> · "
         "<code>/emojioff</code> · <code>/emojibtn on|off</code>"
     )
+
+
+# --------------------------------------------------------------------------- learn from your posts, automatically
+@Client.on_message(filters.channel, group=-6)
+async def learn_from_channel_post(client, message: Message):
+    """Every channel post the bot can see: if it holds premium emoji, that is YOUR style - remember it."""
+    try:
+        pairs = _pairs_from(message)
+        if not pairs or message.chat.id == _log_channel_id_full():
+            return
+        if not _state["loaded"]:
+            await _load_state()
+        n = await _learn_pairs(client, pairs, message.chat.id, message.id)
+        if n:
+            logger.info(f"[premium_emoji] learned {n} new emoji from a post in {message.chat.id}")
+    except Exception:
+        logger.error("[premium_emoji] learning from a channel post failed", exc_info=True)
+
+
+_HAS_PREMIUM_EMOJI = filters.create(lambda _, __, m: bool(_pairs_from(m)))
+
+
+@Client.on_message(filters.private & _ADMIN & _HAS_PREMIUM_EMOJI, group=-6)
+async def learn_from_admin_message(client, message: Message):
+    """An admin sends (or forwards) something with premium emoji to the bot: learn them, silently."""
+    try:
+        if (message.text or "").startswith("/"):
+            return                       # /setemoji has its own handler
+        if not _state["loaded"]:
+            await _load_state()
+        n = await _learn_pairs(client, _pairs_from(message))
+        if n:
+            await message.reply_text(f"<b>✅ {n} naye premium emoji seekh liye.</b> Ab bot mein yahi style lagega.")
+    except Exception:
+        logger.error("[premium_emoji] learning from an admin message failed", exc_info=True)
