@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://files.catbox.moe/yhzga3.jpg" alt="MRN-FILE-STORE-BOT Logo">
+  <img src="https://i.ibb.co/mrbPnPR7/uploaded-image.jpg" alt="MRN-FILE-STORE-BOT Logo">
 </p>
 <h1 align="center">
   MRN FILE STORE BOT
