@@ -1,0 +1,694 @@
+# Premium (animated custom) emoji for the WHOLE bot - in messages, captions AND buttons.
+# This one file does everything; no other file is edited and no env variable / STRING_SESSION is needed.
+#
+# How it works
+#   Every message / caption / edit the bot sends goes through Client.invoke(). This plugin hooks
+#   there. In TEXT it finds the normal emoji (✅ 📁 ⚡ ...) that you mapped and adds a custom-emoji
+#   entity, so users see your premium emoji. On BUTTONS it takes the first mapped emoji out of the
+#   button label and shows it as the button's premium icon (Bot API 9.4 "icon_custom_emoji_id").
+#   All existing texts / buttons in all files keep working unchanged.
+#
+# Telegram rule: premium emoji work in private, group and supergroup chats when the BOT'S OWNER
+# (the account that created the bot in @BotFather) has Telegram Premium. Not supported by Telegram:
+# inline mode (and channels may refuse - those chats are then skipped automatically; LOG_CHANNEL
+# is always skipped).
+#
+# NOTHING TO SET UP. On every start the bot loads the animated emoji of a few public emoji packs
+# straight from Telegram (DEFAULT_PACKS below), matches each one to the normal emoji it stands for,
+# and switches text emoji + button icons ON by itself. The normal emoji of the bot's texts and
+# buttons are then shown as premium emoji wherever the packs have a match; the rest stay normal.
+#
+# Optional (only if you want a different look):
+#   /emojipack <pack link or name>   add another emoji pack (e.g. t.me/addemoji/SomePack)
+#   /setemoji + premium emoji        map single emoji by hand (overrides the packs)
+#   /emoji (status)  /emojioff  /emojion  /emojibtn on|off  /emojilist  /delemoji <emoji or all>
+#
+# Safety: if Telegram ever refuses a message because of the emoji / icons (e.g. the owner's Premium
+# expired), the message is re-sent plain at once, and after 3 such failures in a row that feature
+# switches itself off. Nothing breaks.
+
+import asyncio
+import logging
+import os
+import re
+import time
+from io import BytesIO
+
+from pyrogram import Client, enums, filters, raw
+from pyrogram.errors import FloodWait, RPCError
+from pyrogram.raw.core import TLObject
+from pyrogram.raw.core.primitives import Bytes, Int, Long, String, Vector
+from pyrogram.types import Message
+from pyrogram.utils import get_channel_id
+
+from config import LOG_CHANNEL
+from plugins.admins_db import dynamic_admin_filter
+from plugins.settings_db import get_settings, update_setting
+
+logger = logging.getLogger(__name__)
+
+# Public emoji packs (t.me/addemoji/<name>) used automatically. Earlier = higher priority. Packs that
+# cannot be loaded are skipped; more can be added with /emojipack or the PREMIUM_EMOJI_PACKS env var.
+DEFAULT_PACKS = [
+    "AdaptiveIcons", "AdaptivePremium", "Switches_Emoji", "ColorReactions",
+    "TStarsIcons", "AdaptiveLines", "developeremojis",
+]
+
+MAX_PER_MESSAGE = 80
+MAX_MAPPINGS = 300
+AUTO_OFF_AFTER = 3
+_FE0F = "\ufe0f"
+
+# errors that have nothing to do with emoji: never retried
+_UNRELATED = {
+    "MESSAGE_NOT_MODIFIED", "PEER_ID_INVALID", "INPUT_USER_DEACTIVATED", "USER_IS_BLOCKED",
+    "CHAT_WRITE_FORBIDDEN", "MESSAGE_ID_INVALID", "CHAT_ID_INVALID", "CHANNEL_INVALID",
+    "USER_DEACTIVATED", "MESSAGE_DELETE_FORBIDDEN", "REPLY_MARKUP_INVALID", "BUTTON_URL_INVALID",
+    "BUTTON_DATA_INVALID", "MEDIA_EMPTY", "MESSAGE_EMPTY", "PEER_FLOOD", "BOT_RESPONSE_TIMEOUT",
+    "USER_PRIVACY_RESTRICTED", "CHAT_ADMIN_REQUIRED", "CHANNEL_PRIVATE", "MESSAGE_TOO_LONG",
+}
+
+_state = {
+    "loaded": False, "on": True, "btn_on": True, "map": {}, "rx": None,
+    "txt_fails": 0, "btn_fails": 0,
+    "manual": {},      # emoji you mapped by hand (/setemoji)  - highest priority
+    "auto": {},        # emoji found in the packs
+    "masked": set(),   # emoji you removed with /delemoji
+    "packs": [],       # extra packs added with /emojipack
+    "packs_ok": {},    # pack name -> how many emoji it gave
+    "packs_started": False,
+}
+_BG = set()
+
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _BG.add(t)
+    t.add_done_callback(_BG.discard)
+    return t
+_skip_channels = set()   # channels/supergroups that refused premium emoji once -> never tried again
+
+try:
+    _lc = int(LOG_CHANNEL)
+    _log_channel_id = get_channel_id(_lc) if _lc < -1000000000000 else None
+except Exception:
+    _log_channel_id = None
+
+
+def _u16(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _s64(v: int) -> int:
+    """Telegram ids are signed 64-bit on the wire."""
+    v = int(v)
+    return v - (1 << 64) if v >= (1 << 63) else v
+
+
+def _rebuild():
+    merged = {k: v for k, v in _state["auto"].items() if k not in _state["masked"]}
+    merged.update(_state["manual"])
+    _state["map"] = merged
+    keys = sorted(_state["map"], key=len, reverse=True)
+    if not keys:
+        _state["rx"] = None
+        return
+    # never cut a ZWJ sequence (👨‍💻) or a skin-tone emoji in half
+    pat = "|".join("(?<!\u200d)" + re.escape(k) + _FE0F + "?(?![\u200d\U0001F3FB-\U0001F3FF])" for k in keys)
+    _state["rx"] = re.compile(pat)
+
+
+async def _load_state():
+    if time.monotonic() < _state.get("retry_at", 0):
+        return
+    try:
+        st = await get_settings()
+    except Exception:
+        _state["retry_at"] = time.monotonic() + 30   # database not ready: don't hammer it, retry in 30s
+        return
+    # ON by default; only an explicit /emojioff, /emojibtn off or an automatic safety switch-off turns them off
+    on, btn = st.get("premium_emoji"), st.get("premium_btn")
+    _state["on"] = True if on is None else bool(on)
+    _state["btn_on"] = True if btn is None else bool(btn)
+    manual = {}
+    for pair in st.get("premium_emoji_map") or []:
+        try:
+            manual[str(pair[0])] = _s64(pair[1])
+        except Exception:
+            continue
+    _state["manual"] = manual
+    _state["masked"] = set(st.get("premium_emoji_mask") or [])
+    _state["packs"] = [str(x) for x in (st.get("premium_emoji_packs") or [])]
+    _rebuild()
+    _state["loaded"] = True
+
+
+async def _fetch_pack(client, name):
+    """{normal emoji: custom emoji id} for one public emoji pack (empty if it cannot be loaded)."""
+    res = await client.invoke(
+        raw.functions.messages.GetStickerSet(stickerset=raw.types.InputStickerSetShortName(short_name=name), hash=0),
+        retries=2, timeout=20,
+    )
+    out = {}
+    for doc in getattr(res, "documents", None) or []:
+        for attr in doc.attributes:
+            if isinstance(attr, raw.types.DocumentAttributeCustomEmoji) and attr.alt:
+                out.setdefault(attr.alt.replace(_FE0F, "").strip(), _s64(doc.id))
+    return out
+
+
+async def _autoload_packs(client):
+    """Load the packs from Telegram and merge them (earlier pack wins). Runs once per start."""
+    if _state["packs_started"]:
+        return
+    _state["packs_started"] = True
+    names = list(DEFAULT_PACKS) + [n for n in os.environ.get("PREMIUM_EMOJI_PACKS", "").split() if n]
+    await _load_state() if not _state["loaded"] else None
+    names += [n for n in _state["packs"] if n not in names]
+    auto, ok = {}, {}
+    for name in names:
+        try:
+            got = await _fetch_pack(client, name)
+        except Exception as e:
+            logger.warning(f"[premium_emoji] pack '{name}' could not be loaded: {type(e).__name__}: {e}")
+            continue
+        ok[name] = len(got)
+        for k, v in got.items():
+            auto.setdefault(k, v)
+    _state["auto"], _state["packs_ok"] = auto, ok
+    _rebuild()
+    logger.info(f"[premium_emoji] {len(auto)} emoji loaded from {len(ok)}/{len(names)} packs "
+                f"({', '.join(f'{n}:{c}' for n, c in ok.items())}); text={'ON' if _state['on'] else 'OFF'} "
+                f"buttons={'ON' if _state['btn_on'] else 'OFF'}")
+
+
+async def _startup():
+    try:
+        from TechVJ.bot import StreamBot
+    except Exception:
+        return
+    for _ in range(90):   # wait (up to ~3 min) until the bot is fully started
+        if StreamBot.is_connected and getattr(StreamBot, "me", None) is not None:
+            break
+        await asyncio.sleep(2)
+    else:
+        return
+    await _load_state()
+    await _autoload_packs(StreamBot)
+
+
+async def _save_map():
+    await update_setting("premium_emoji_map", [[k, str(v)] for k, v in _state["manual"].items()])
+    await update_setting("premium_emoji_mask", sorted(_state["masked"]))
+
+
+# --------------------------------------------------------------------------- text
+def _inject(text, entities):
+    """Returns a new entity list with premium emoji added, or None if nothing to add."""
+    rx = _state["rx"]
+    if not text or rx is None:
+        return None
+    entities = list(entities or [])
+    blocked = [
+        (e.offset, e.offset + e.length)
+        for e in entities
+        if isinstance(e, (raw.types.MessageEntityCustomEmoji, raw.types.MessageEntityCode, raw.types.MessageEntityPre))
+    ]
+    mapping = _state["map"]
+    added, pos16, last = [], 0, 0
+    for m in rx.finditer(text):
+        pos16 += _u16(text[last:m.start()])
+        last = m.start()
+        doc_id = mapping.get(m.group().replace(_FE0F, ""))
+        length = _u16(m.group())
+        if doc_id is None or any(a <= pos16 < b for a, b in blocked):
+            continue
+        added.append(raw.types.MessageEntityCustomEmoji(offset=pos16, length=length, document_id=doc_id))
+        if len(added) >= MAX_PER_MESSAGE:
+            break
+    if not added:
+        return None
+    return sorted(entities + added, key=lambda e: e.offset)
+
+
+# --------------------------------------------------------------------------- buttons
+# Telegram's newest TL layer describes inline buttons in a NEW format that carries a "style"
+# with the premium icon. pyrofork 2.3.69 (layer 220) predates it, so the few classes needed to
+# WRITE such a keyboard are defined here. Layouts and ids are copied from the layer-229 schema
+# and verified byte-for-byte against kurigram's generated classes. They are only ever written,
+# never read: Telegram still answers in the old format because the session declares layer 220.
+class _BtnStyle(TLObject):
+    __slots__ = ["icon"]
+    ID = 0x4FDD3430
+    QUALNAME = "types.KeyboardButtonStyle"
+
+    def __init__(self, *, icon=None):
+        self.icon = icon
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(Int((1 << 3) if self.icon is not None else 0))      # flags: icon
+        if self.icon is not None:
+            b.write(Long(self.icon))
+        return b.getvalue()
+
+
+class _BtnTypeUrl(TLObject):
+    __slots__ = ["url"]
+    ID = 0xECA4F8D4
+    QUALNAME = "types.InlineButtonTypeUrl"
+
+    def __init__(self, *, url):
+        self.url = url
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(String(self.url))
+        return b.getvalue()
+
+
+class _BtnTypeCallback(TLObject):
+    __slots__ = ["data", "requires_password"]
+    ID = 0x2955BC38
+    QUALNAME = "types.InlineButtonTypeCallback"
+
+    def __init__(self, *, data, requires_password=None):
+        self.data = data
+        self.requires_password = requires_password
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(Int((1 << 0) if self.requires_password else 0))     # flags: requires_password
+        b.write(Bytes(self.data))
+        return b.getvalue()
+
+
+class _Btn(TLObject):
+    __slots__ = ["text", "type", "style"]
+    ID = 0x11C1A322
+    QUALNAME = "types.KeyboardInlineButton"
+
+    def __init__(self, *, text, type, style=None):
+        self.text = text
+        self.type = type
+        self.style = style
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(Int((1 << 10) if self.style is not None else 0))    # flags: style
+        if self.style is not None:
+            b.write(self.style.write())
+        b.write(String(self.text))
+        b.write(self.type.write())
+        return b.getvalue()
+
+
+class _BtnRow(TLObject):
+    __slots__ = ["buttons"]
+    ID = 0x19420AF6
+    QUALNAME = "types.KeyboardInlineButtonRow"
+
+    def __init__(self, *, buttons):
+        self.buttons = buttons
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(Vector(self.buttons))
+        return b.getvalue()
+
+
+class _BtnMarkup(TLObject):
+    __slots__ = ["rows", "force_reply"]
+    ID = 0xB2B15770
+    QUALNAME = "types.ReplyInlineMarkup"
+
+    def __init__(self, *, rows, force_reply=None):
+        self.rows = rows
+        self.force_reply = force_reply
+
+    def write(self, *args) -> bytes:
+        b = BytesIO()
+        b.write(Int(self.ID, False))
+        b.write(Int((1 << 5) if self.force_reply else 0))           # flags: force_reply
+        b.write(Vector(self.rows))
+        return b.getvalue()
+
+
+def _split_icon(label: str):
+    """'🚀 FAST DOWNLOAD 🚀' -> ('FAST DOWNLOAD', icon_id) using the first mapped emoji."""
+    rx = _state["rx"]
+    if rx is None or not label:
+        return label, None
+    for m in rx.finditer(label):
+        key = m.group().replace(_FE0F, "")
+        doc_id = _state["map"].get(key)
+        if doc_id is None:
+            continue
+        cleaned = re.sub(re.escape(key) + _FE0F + "?", "", label)   # the icon replaces every copy
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        return (cleaned, doc_id) if cleaned else (label, None)
+    return label, None
+
+
+def _style_markup(markup):
+    """Old-format inline keyboard -> new format with premium icons, or None if there is nothing to
+    change / the keyboard holds a button kind we do not convert (then it is sent untouched)."""
+    if type(markup) is not raw.types.ReplyInlineMarkup:
+        return None
+    rows, any_icon = [], False
+    for row in markup.rows:
+        buttons = []
+        for btn in row.buttons:
+            kind = type(btn)
+            if kind is raw.types.KeyboardButtonUrl:
+                typ = _BtnTypeUrl(url=btn.url)
+            elif kind is raw.types.KeyboardButtonCallback:
+                typ = _BtnTypeCallback(data=btn.data, requires_password=getattr(btn, "requires_password", None))
+            else:
+                return None
+            text, icon = _split_icon(btn.text)
+            any_icon = any_icon or icon is not None
+            buttons.append(_Btn(text=text, type=typ, style=_BtnStyle(icon=icon) if icon is not None else None))
+        rows.append(_BtnRow(buttons=buttons))
+    if not any_icon:
+        return None
+    return _BtnMarkup(rows=rows, force_reply=getattr(markup, "force_reply", None))
+
+
+# --------------------------------------------------------------------------- the hook
+def _skip_peer(peer) -> bool:
+    return isinstance(peer, raw.types.InputPeerChannel) and (
+        peer.channel_id == _log_channel_id or peer.channel_id in _skip_channels
+    )
+
+
+def _targets(query):
+    f = raw.functions.messages
+    t = type(query)
+    if t in (f.SendMessage, f.SendMedia, f.EditMessage):
+        return [] if _skip_peer(query.peer) else [query]
+    if t is f.SendMultiMedia:
+        return [] if _skip_peer(query.peer) else list(query.multi_media)
+    return []
+
+
+_orig_invoke = Client.invoke
+
+
+def _revert(undo, kind):
+    for k, obj, attr, old in undo:
+        if k == kind:
+            setattr(obj, attr, old)
+
+
+def _retryable(e) -> bool:
+    return not isinstance(e, FloodWait) and getattr(e, "ID", "") not in _UNRELATED
+
+
+async def _blame(kind, peer):
+    """The plain re-send worked, so `kind` ('txt' or 'btn') is what Telegram refused."""
+    if isinstance(peer, raw.types.InputPeerChannel):
+        _skip_channels.add(peer.channel_id)      # that channel does not take premium emoji: skip it from now on
+        logger.warning(f"[premium_emoji] channel {peer.channel_id} refused premium {kind}; skipping it from now on")
+        return
+    key = f"{kind}_fails"
+    _state[key] += 1
+    logger.warning(f"[premium_emoji] Telegram refused premium {'emoji' if kind == 'txt' else 'button icons'}; "
+                   f"sent plain instead ({_state[key]}/{AUTO_OFF_AFTER})")
+    if _state[key] >= AUTO_OFF_AFTER:
+        flag, setting = ("on", "premium_emoji") if kind == "txt" else ("btn_on", "premium_btn")
+        _state[flag] = False
+        logger.error(f"[premium_emoji] switched {'emoji' if kind == 'txt' else 'button icons'} OFF automatically - "
+                     "does the bot owner still have Telegram Premium?")
+        try:
+            await update_setting(setting, False)
+        except Exception:
+            pass
+
+
+async def _invoke(self, query, *args, **kwargs):
+    targets = _targets(query)
+    if not targets:                      # login, downloads, reactions, ... : not our business
+        return await _orig_invoke(self, query, *args, **kwargs)
+    if not _state["loaded"]:
+        await _load_state()
+    if not _state["packs_started"] and _state["loaded"]:
+        _spawn(_autoload_packs(self))    # normally already done at startup; this is the safety net
+    undo = []                            # (kind, object, attribute, original value)
+    if _state["on"] and _state["rx"] is not None:
+        for tgt in targets:
+            new = _inject(getattr(tgt, "message", None), getattr(tgt, "entities", None))
+            if new is not None:
+                undo.append(("txt", tgt, "entities", tgt.entities))
+                tgt.entities = new
+    if _state["btn_on"] and _state["rx"] is not None and getattr(query, "reply_markup", None) is not None:
+        new = _style_markup(query.reply_markup)
+        if new is not None:
+            undo.append(("btn", query, "reply_markup", query.reply_markup))
+            query.reply_markup = new
+    if not undo:
+        return await _orig_invoke(self, query, *args, **kwargs)
+    kinds = {u[0] for u in undo}
+    call_kwargs = kwargs
+    if "btn" in kinds:   # the new button format is only ever tried with a SHORT timeout, then plain
+        call_kwargs = dict(kwargs)
+        call_kwargs.setdefault("retries", 2)
+        call_kwargs.setdefault("timeout", 12)
+    try:
+        result = await _orig_invoke(self, query, *args, **call_kwargs)
+        for k in kinds:
+            _state[f"{k}_fails"] = 0
+        return result
+    except (RPCError, asyncio.TimeoutError, TimeoutError, OSError) as e:
+        if isinstance(e, RPCError):
+            if not _retryable(e):
+                raise
+        elif "btn" not in kinds:
+            raise                        # a plain network problem, nothing to do with emoji
+        # maybe Telegram refused the premium emoji / icons (owner Premium expired?) - find out which
+        blamed = None
+        if "btn" in kinds:
+            _revert(undo, "btn")
+            try:
+                result = await _orig_invoke(self, query, *args, **kwargs)
+                blamed = "btn"
+            except RPCError as e2:
+                if not _retryable(e2):
+                    raise
+        if blamed is None:
+            _revert(undo, "txt")
+            _revert(undo, "btn")
+            result = await _orig_invoke(self, query, *args, **kwargs)   # raises again if it was something else
+            blamed = "txt" if "txt" in kinds else "btn"
+        await _blame(blamed, query.peer)
+        return result
+
+
+if not getattr(Client.invoke, "_premium_patched", False):
+    _invoke._premium_patched = True
+    Client.invoke = _invoke
+    try:
+        _spawn(_startup())     # plugins load while the event loop runs; harmless otherwise
+    except RuntimeError:
+        pass
+
+
+# --------------------------------------------------------------------------- admin commands
+_ADMIN = dynamic_admin_filter("can_manage_admins")
+
+
+def _learn_from(m: Message) -> dict:
+    text = m.text or m.caption or ""
+    ents = m.entities or m.caption_entities or []
+    u = str(text).encode("utf-16-le")
+    out = {}
+    for e in ents:
+        if e.type != enums.MessageEntityType.CUSTOM_EMOJI:
+            continue
+        ch = u[e.offset * 2:(e.offset + e.length) * 2].decode("utf-16-le", "ignore").replace(_FE0F, "").strip()
+        if ch and e.custom_emoji_id:
+            out[ch] = _s64(e.custom_emoji_id)
+    return out
+
+
+async def _ensure_loaded():
+    if not _state["loaded"]:
+        await _load_state()
+
+
+@Client.on_message(filters.command("setemoji") & filters.private & _ADMIN)
+async def set_emoji_cmd(client, message: Message):
+    await _ensure_loaded()
+    learned = _learn_from(message)
+    if message.reply_to_message:
+        learned.update(_learn_from(message.reply_to_message))
+    if not learned:
+        return await message.reply_text(
+            "<b>Premium emoji kaise set karein:</b>\n\n"
+            "<code>/setemoji</code> ke saath apne <b>premium emoji</b> bhejo (same message mein), "
+            "ya kisi premium emoji wale message ko reply karke <code>/setemoji</code> likho.\n\n"
+            "Har premium emoji apne normal emoji ki jagah le leta hai (jaise premium ✅ → normal ✅).\n"
+            "Phir <code>/emojion</code> (text) aur <code>/emojibtn on</code> (buttons) se chalu karo."
+        )
+    if len(_state["map"]) + len(learned) > MAX_MAPPINGS:
+        return await message.reply_text(f"<b>❌ Max {MAX_MAPPINGS} emoji mappings allowed.</b>")
+    _state["manual"].update(learned)
+    _state["masked"] -= set(learned)
+    _rebuild()
+    await _save_map()
+    await message.reply_text(
+        f"<b>✅ {len(learned)} emoji saved</b> (total {len(_state['map'])}).\n"
+        + ("Ab <code>/emojion</code> bhejo." if not _state["on"] else "Ye turant lagu ho gaye.")
+    )
+
+
+@Client.on_message(filters.command("emojion") & filters.private & _ADMIN)
+async def emoji_on_cmd(client, message: Message):
+    await _ensure_loaded()
+    if not _state["map"]:
+        return await message.reply_text("<b>Pehle <code>/setemoji</code> se kuch premium emoji set karo.</b>")
+    ch, doc_id = next(iter(_state["map"].items()))
+    try:
+        # explicit entity, so this test works whatever the current switch state is
+        await client.send_message(
+            message.chat.id,
+            f'<emoji id="{doc_id}">{ch}</emoji> Premium emoji test',
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception as e:
+        _state["on"] = False
+        return await message.reply_text(
+            "<b>❌ Telegram ne premium emoji accept nahi kiya.</b>\n\n"
+            "Bot ke <b>owner account</b> (jisse BotFather mein bot banaya) ke paas Telegram Premium hona chahiye.\n\n"
+            f"<code>{type(e).__name__}: {e}</code>"
+        )
+    _state["on"] = True
+    _state["txt_fails"] = 0
+    await update_setting("premium_emoji", True)
+    await message.reply_text(
+        "<b>✅ Premium emoji ON.</b> Test message mein animated emoji dikh raha hai to sab theek hai.\n"
+        "Buttons ke liye: <code>/emojibtn on</code>"
+    )
+
+
+@Client.on_message(filters.command("emojioff") & filters.private & _ADMIN)
+async def emoji_off_cmd(client, message: Message):
+    _state["on"] = False
+    await update_setting("premium_emoji", False)
+    await message.reply_text("<b>Premium emoji (text) OFF.</b> Mappings saved hain, <code>/emojion</code> se wapas chalu karo.")
+
+
+@Client.on_message(filters.command("emojibtn") & filters.private & _ADMIN)
+async def emoji_btn_cmd(client, message: Message):
+    await _ensure_loaded()
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg == "off":
+        _state["btn_on"] = False
+        await update_setting("premium_btn", False)
+        return await message.reply_text("<b>Button icons OFF.</b> Buttons ab normal emoji ke saath aayenge.")
+    if arg != "on":
+        return await message.reply_text(
+            f"<b>Button icons:</b> {'ON ✅' if _state['btn_on'] else 'OFF ❌'}\n\n"
+            "<code>/emojibtn on</code> - test karke chalu karta hai\n<code>/emojibtn off</code> - band"
+        )
+    if not _state["map"]:
+        return await message.reply_text("<b>Pehle <code>/setemoji</code> se kuch premium emoji set karo.</b>")
+    ch, doc_id = next(iter(_state["map"].items()))
+    markup = _BtnMarkup(rows=[_BtnRow(buttons=[_Btn(
+        text="Button test", type=_BtnTypeCallback(data=b"premium_btn_test"), style=_BtnStyle(icon=doc_id),
+    )])])
+    try:
+        await client.invoke(
+            raw.functions.messages.SendMessage(
+                peer=await client.resolve_peer(message.chat.id),
+                message=f"Button premium emoji test ({ch})",
+                random_id=client.rnd_id(),
+                reply_markup=markup,
+            ),
+            retries=1, timeout=20,
+        )
+    except Exception as e:
+        _state["btn_on"] = False
+        return await message.reply_text(
+            "<b>❌ Telegram ne button icons accept nahi kiye.</b>\n\n"
+            "Ya to bot owner ke paas Premium nahi hai, ya Telegram abhi is purane library-format pe button icons "
+            "nahi leta. Text wale premium emoji pe koi asar nahi hai, wo chalte rahenge.\n\n"
+            f"<code>{type(e).__name__}: {e}</code>"
+        )
+    _state["btn_on"] = True
+    _state["btn_fails"] = 0
+    await update_setting("premium_btn", True)
+    await message.reply_text(
+        "<b>✅ Button icons ON.</b>\n\nUpar wale test message ke button pe <b>animated emoji</b> dikh raha hai? "
+        "Agar sirf plain text dikhe (icon na dikhe), to <code>/emojibtn off</code> kar do."
+    )
+
+
+@Client.on_message(filters.command("emojipack") & filters.private & _ADMIN)
+async def emoji_pack_cmd(client, message: Message):
+    await _ensure_loaded()
+    arg = message.command[1].strip() if len(message.command) > 1 else ""
+    name = re.sub(r"^.*addemoji/", "", arg).strip("/ ")
+    if not name:
+        packs = ", ".join(f"{n} ({c})" for n, c in _state["packs_ok"].items()) or "—"
+        return await message.reply_text(
+            f"<b>Loaded packs:</b> {packs}\n\nNaya pack jodne ke liye: <code>/emojipack t.me/addemoji/PackName</code>"
+        )
+    try:
+        got = await _fetch_pack(client, name)
+    except Exception as e:
+        return await message.reply_text(f"<b>❌ Pack load nahi hua:</b> <code>{type(e).__name__}</code>")
+    if not got:
+        return await message.reply_text("<b>❌ Is pack mein koi emoji nahi mila.</b>")
+    if name not in _state["packs"]:
+        _state["packs"].append(name)
+        await update_setting("premium_emoji_packs", _state["packs"])
+    for k, v in got.items():
+        _state["auto"].setdefault(k, v)
+    _state["packs_ok"][name] = len(got)
+    _rebuild()
+    await message.reply_text(f"<b>✅ {name}: {len(got)} emoji jude.</b> Total {len(_state['map'])}.")
+
+
+@Client.on_message(filters.command("delemoji") & filters.private & _ADMIN)
+async def del_emoji_cmd(client, message: Message):
+    await _ensure_loaded()
+    parts = (message.text or "").split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        return await message.reply_text("<b>Usage:</b> <code>/delemoji ✅ 📁</code> ya <code>/delemoji all</code>")
+    if arg.lower() == "all":
+        n = len(_state["map"])
+        _state["manual"].clear()
+        _state["masked"] = set(_state["auto"])
+    else:
+        n = 0
+        for ch in list(_state["map"]):
+            if ch in arg.replace(_FE0F, ""):
+                _state["manual"].pop(ch, None)
+                if ch in _state["auto"]:
+                    _state["masked"].add(ch)
+                n += 1
+    _rebuild()
+    await _save_map()
+    await message.reply_text(f"<b>🗑 {n} emoji removed</b> ({len(_state['map'])} left).")
+
+
+@Client.on_message(filters.command(["emoji", "emojilist"]) & filters.private & _ADMIN)
+async def emoji_status_cmd(client, message: Message):
+    await _ensure_loaded()
+    m = _state["map"]
+    listing = " ".join(m) if m else "—"
+    await message.reply_text(
+        f"<b>Premium emoji (text):</b> {'ON ✅' if _state['on'] else 'OFF ❌'}\n"
+        f"<b>Button icons:</b> {'ON ✅' if _state['btn_on'] else 'OFF ❌'}\n"
+        f"<b>Mapped:</b> {len(m)} (packs {len(_state['auto'])}, by hand {len(_state['manual'])})\n"
+        f"<b>Packs:</b> {', '.join(f'{n} ({c})' for n, c in _state['packs_ok'].items()) or '—'}\n\n{listing}\n\n"
+        "<code>/setemoji</code> · <code>/delemoji</code> · <code>/emojion</code> · <code>/emojioff</code> · "
+        "<code>/emojibtn on</code> · <code>/emojibtn off</code>"
+    )
