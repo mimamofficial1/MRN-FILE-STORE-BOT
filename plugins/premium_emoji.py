@@ -59,6 +59,7 @@ DEFAULT_PACKS = [
 MAX_PER_MESSAGE = 80
 MAX_MAPPINGS = 300
 AUTO_OFF_AFTER = 3
+ID_STRIKES = 3     # an emoji id that failed this many times and never once worked is dropped
 _FE0F = "\ufe0f"
 
 # errors that have nothing to do with emoji: never retried
@@ -186,21 +187,60 @@ def _bot_emoji():
 
 async def _search_missing(client, auto):
     """For emoji the bot uses but no pack has: ask Telegram's emoji search for a matching premium
-    emoji (best effort - skipped quietly if Telegram does not allow bots to search)."""
+    emoji. Returns (found, missing, refused) - refused=True if Telegram does not let this account search."""
     missing = sorted(e for e in _bot_emoji() if e not in auto and not _NOT_REAL_EMOJI.match(e))
     found = 0
     for ch in missing:
         try:
             res = await client.invoke(raw.functions.messages.SearchCustomEmoji(emoticon=ch, hash=0), retries=1, timeout=15)
         except Exception as e:
-            logger.info(f"[premium_emoji] emoji search not available ({type(e).__name__}); "
-                        f"{len(missing) - found} emoji stay normal")
-            return found, missing
+            logger.info(f"[premium_emoji] emoji search not available for this account ({type(e).__name__})")
+            return found, missing, True
         ids = getattr(res, "document_id", None) or []
         if ids:
             auto.setdefault(ch, _s64(ids[0]))
             found += 1
-    return found, missing
+    return found, missing, False
+
+
+async def _valid_ids(client, ids):
+    """The subset of `ids` that Telegram confirms are real custom emoji (None if the check is not possible)."""
+    ids = sorted(set(ids))
+    valid = set()
+    try:
+        for i in range(0, len(ids), 100):
+            res = await client.invoke(raw.functions.messages.GetCustomEmojiDocuments(document_id=ids[i:i + 100]),
+                                      retries=1, timeout=20)
+            for d in res:
+                if isinstance(d, raw.types.Document) and any(
+                        isinstance(a, raw.types.DocumentAttributeCustomEmoji) for a in d.attributes):
+                    valid.add(d.id)
+    except Exception as e:
+        logger.info(f"[premium_emoji] could not validate emoji ids ({type(e).__name__}); using them as they are")
+        return None
+    return valid
+
+
+_user = {"client": None, "tried": False}
+
+
+async def _user_client():
+    """OPTIONAL: a user session (env STRING_SESSION) used ONLY to look up emoji ids at startup
+    (read-only, never sends anything). Helps when Telegram does not let the bot search/load them."""
+    sess = os.environ.get("STRING_SESSION", "").strip()
+    if not sess or _user["tried"]:
+        return _user["client"]
+    _user["tried"] = True
+    try:
+        from config import API_HASH, API_ID
+        c = Client("emoji_lookup", api_id=API_ID, api_hash=API_HASH, session_string=sess,
+                   in_memory=True, no_updates=True)
+        await c.start()
+        _user["client"] = c
+        logger.info("[premium_emoji] user session started for emoji lookup")
+    except Exception as e:
+        logger.warning(f"[premium_emoji] STRING_SESSION could not be used: {type(e).__name__}: {e}")
+    return _user["client"]
 
 
 async def _autoload_packs(client):
@@ -211,29 +251,112 @@ async def _autoload_packs(client):
     names = list(DEFAULT_PACKS) + [n for n in os.environ.get("PREMIUM_EMOJI_PACKS", "").split() if n]
     await _load_state() if not _state["loaded"] else None
     names += [n for n in _state["packs"] if n not in names]
-    auto, ok = {}, {}
+    auto, ok, failed = {}, {}, []
     for name in names:
         try:
             got = await _fetch_pack(client, name)
         except Exception as e:
+            failed.append(name)
             logger.warning(f"[premium_emoji] pack '{name}' could not be loaded: {type(e).__name__}: {e}")
             continue
         ok[name] = len(got)
         for k, v in got.items():
             auto.setdefault(k, v)
+    user = None
+    search = "ok"
     try:
-        searched, missing = await _search_missing(client, auto)
-    except Exception as e:
-        searched, missing = 0, []
-        logger.warning(f"[premium_emoji] emoji search failed: {type(e).__name__}: {e}")
-    still = sorted(e for e in missing if e not in auto)
+        if failed:                                   # packs the bot could not load -> optional user session
+            user = await _user_client()
+            for name in list(failed) if user else []:
+                try:
+                    got = await _fetch_pack(user, name)
+                except Exception:
+                    continue
+                failed.remove(name)
+                ok[name] = len(got)
+                for k, v in got.items():
+                    auto.setdefault(k, v)
+        try:
+            _found, missing, refused = await _search_missing(client, auto)
+            if refused:
+                search = "refused"
+                user = user or await _user_client()
+                if user:
+                    _found, missing, refused = await _search_missing(user, auto)
+                    search = "ok (user session)" if not refused else "refused"
+        except Exception as e:
+            missing, search = [], f"error {type(e).__name__}"
+        valid = await _valid_ids(client, auto.values())
+        if valid is None and user:
+            valid = await _valid_ids(user, auto.values())
+        invalid = 0
+        # only trust the check if it confirms at least half of the ids; an empty / near-empty answer
+        # means the check itself is unreliable, and then nothing is thrown away
+        if valid is not None and len(valid) >= max(1, len(set(auto.values())) // 2):
+            for k in [k for k, v in auto.items() if v not in valid]:
+                del auto[k]
+                invalid += 1
+        elif valid is not None:
+            logger.info(f"[premium_emoji] id check confirmed only {len(valid)} of {len(set(auto.values()))} ids; "
+                        "ignoring the check")
+    finally:
+        if user is not None:
+            try:
+                await user.stop()
+            except Exception:
+                pass
     _state["auto"], _state["packs_ok"] = auto, ok
     _rebuild()
+    real = {e for e in _bot_emoji() if not _NOT_REAL_EMOJI.match(e)}
+    still = sorted(e for e in real if e not in _state["map"])
+    _state["report"] = {"packs": ok, "failed": failed, "total": len(real), "covered": len(real) - len(still),
+                        "missing": still, "invalid": invalid, "search": search}
+    logger.info(f"[premium_emoji] {len(real) - len(still)}/{len(real)} of the bot's emoji have a premium version "
+                f"(packs: {', '.join(f'{n}:{c}' for n, c in ok.items()) or 'none'}; failed packs: {failed or 'none'}; "
+                f"invalid ids dropped: {invalid}; emoji search: {search}); "
+                f"text={'ON' if _state['on'] else 'OFF'} buttons={'ON' if _state['btn_on'] else 'OFF'}")
     if still:
         logger.info(f"[premium_emoji] no premium version found for: {' '.join(still)}")
-    logger.info(f"[premium_emoji] {len(auto)} emoji loaded from {len(ok)}/{len(names)} packs "
-                f"({', '.join(f'{n}:{c}' for n, c in ok.items())}); text={'ON' if _state['on'] else 'OFF'} "
-                f"buttons={'ON' if _state['btn_on'] else 'OFF'}")
+
+
+def _report_text():
+    r = _state.get("report")
+    if not r:
+        return "Premium emoji: abhi load ho raha hai..."
+    lines = [
+        f"<b>📊 Coverage:</b> {r['covered']}/{r['total']} emoji premium ho sakte hain",
+        "<b>📦 Packs:</b> " + (", ".join(f"{n} ({c})" for n, c in r["packs"].items()) or "koi nahi"),
+    ]
+    if r["failed"]:
+        lines.append("<b>❌ Load nahi hue:</b> " + ", ".join(r["failed"]))
+    lines.append(f"<b>🔎 Emoji search:</b> {r['search']}")
+    if r["invalid"]:
+        lines.append(f"<b>🗑 Galat IDs hataye:</b> {r['invalid']}")
+    if r["missing"]:
+        lines.append("<b>Normal rahenge:</b> " + " ".join(r["missing"]))
+    return "\n".join(lines)
+
+
+async def _notify_admin(client):
+    """If something is missing, tell the first admin ONCE (at most once an hour) - so nobody has to dig
+    through logs. Silent when everything is covered."""
+    r = _state.get("report")
+    if not r or not (r["missing"] or r["failed"] or r["invalid"]):
+        return
+    try:
+        from config import ADMINS
+        admin = next(a for a in ADMINS if isinstance(a, int))
+        st = await get_settings()
+        if time.time() - float(st.get("premium_emoji_report_ts") or 0) < 3600:
+            return
+        await update_setting("premium_emoji_report_ts", time.time())
+        await client.send_message(
+            admin,
+            "<b>✅ Premium emoji status</b>\n\n" + _report_text() +
+            f"\n\n<b>Text:</b> {'ON' if _state['on'] else 'OFF'} · <b>Buttons:</b> {'ON' if _state['btn_on'] else 'OFF'}",
+        )
+    except Exception as e:
+        logger.info(f"[premium_emoji] status message not sent: {type(e).__name__}")
 
 
 async def _startup():
@@ -249,6 +372,7 @@ async def _startup():
         return
     await _load_state()
     await _autoload_packs(StreamBot)
+    await _notify_admin(StreamBot)
 
 
 async def _save_map():
@@ -455,13 +579,33 @@ _orig_invoke = Client.invoke
 
 
 def _revert(undo, kind):
-    for k, obj, attr, old in undo:
-        if k == kind:
-            setattr(obj, attr, old)
+    for u in undo:
+        if u[0] == kind:
+            setattr(u[1], u[2], u[3])
 
 
 def _retryable(e) -> bool:
     return not isinstance(e, FloodWait) and getattr(e, "ID", "") not in _UNRELATED
+
+
+# Per emoji-id experience: a message that carried id X went through (ok) or had to be re-sent
+# plain (bad). An id that keeps failing and never once worked is thrown away, so ONE bad emoji
+# can no longer turn a whole message plain.
+_id_ok, _id_bad = {}, {}
+_ERR_LOGGED = {"n": 0}
+
+
+def _forget_bad():
+    dead = {i for i, n in _id_bad.items() if n >= ID_STRIKES and _id_ok.get(i, 0) == 0}
+    if not dead:
+        return
+    for store in ("auto", "manual"):
+        for k in [k for k, v in _state[store].items() if v in dead]:
+            del _state[store][k]
+    for i in dead:
+        _id_bad.pop(i, None)
+    _rebuild()
+    logger.warning(f"[premium_emoji] dropped {len(dead)} emoji id(s) that Telegram keeps refusing: {sorted(dead)}")
 
 
 async def _blame(kind, peer):
@@ -475,14 +619,11 @@ async def _blame(kind, peer):
     logger.warning(f"[premium_emoji] Telegram refused premium {'emoji' if kind == 'txt' else 'button icons'}; "
                    f"sent plain instead ({_state[key]}/{AUTO_OFF_AFTER})")
     if _state[key] >= AUTO_OFF_AFTER:
-        flag, setting = ("on", "premium_emoji") if kind == "txt" else ("btn_on", "premium_btn")
-        _state[flag] = False
-        logger.error(f"[premium_emoji] switched {'emoji' if kind == 'txt' else 'button icons'} OFF automatically - "
+        # switched off for THIS run only (not saved): the next start tries again, so a temporary
+        # problem can never leave the feature stuck off forever
+        _state["on" if kind == "txt" else "btn_on"] = False
+        logger.error(f"[premium_emoji] switched {'emoji' if kind == 'txt' else 'button icons'} OFF until the next restart - "
                      "does the bot owner still have Telegram Premium?")
-        try:
-            await update_setting(setting, False)
-        except Exception:
-            pass
 
 
 async def _invoke(self, query, *args, **kwargs):
@@ -493,17 +634,21 @@ async def _invoke(self, query, *args, **kwargs):
         await _load_state()
     if not _state["packs_started"] and _state["loaded"]:
         _spawn(_autoload_packs(self))    # normally already done at startup; this is the safety net
-    undo = []                            # (kind, object, attribute, original value)
+    undo = []                            # (kind, object, attribute, original value, emoji ids added)
     if _state["on"] and _state["rx"] is not None:
         for tgt in targets:
-            new = _inject(getattr(tgt, "message", None), getattr(tgt, "entities", None))
+            old = getattr(tgt, "entities", None)
+            new = _inject(getattr(tgt, "message", None), old)
             if new is not None:
-                undo.append(("txt", tgt, "entities", tgt.entities))
+                old_ids = {id(e) for e in (old or [])}
+                ids = [e.document_id for e in new
+                       if type(e) is raw.types.MessageEntityCustomEmoji and id(e) not in old_ids]
+                undo.append(("txt", tgt, "entities", old, ids))
                 tgt.entities = new
     if _state["btn_on"] and _state["rx"] is not None and getattr(query, "reply_markup", None) is not None:
         new = _style_markup(query.reply_markup)
         if new is not None:
-            undo.append(("btn", query, "reply_markup", query.reply_markup))
+            undo.append(("btn", query, "reply_markup", query.reply_markup, []))
             query.reply_markup = new
     if not undo:
         return await _orig_invoke(self, query, *args, **kwargs)
@@ -517,6 +662,9 @@ async def _invoke(self, query, *args, **kwargs):
         result = await _orig_invoke(self, query, *args, **call_kwargs)
         for k in kinds:
             _state[f"{k}_fails"] = 0
+        for u in undo:
+            for i in u[4]:
+                _id_ok[i] = _id_ok.get(i, 0) + 1
         return result
     except (RPCError, asyncio.TimeoutError, TimeoutError, OSError) as e:
         if isinstance(e, RPCError):
@@ -524,9 +672,13 @@ async def _invoke(self, query, *args, **kwargs):
                 raise
         elif "btn" not in kinds:
             raise                        # a plain network problem, nothing to do with emoji
-        # maybe Telegram refused the premium emoji / icons (owner Premium expired?) - find out which
+        if _ERR_LOGGED["n"] < 30:
+            _ERR_LOGGED["n"] += 1
+            logger.warning(f"[premium_emoji] {type(query).__name__} with {'+'.join(sorted(kinds))} failed: "
+                           f"{type(e).__name__} {getattr(e, 'ID', '')} - retrying without it")
+        txt = [u for u in undo if u[0] == "txt"]
         blamed = None
-        if "btn" in kinds:
+        if "btn" in kinds:               # step 1: take only the button icons away
             _revert(undo, "btn")
             try:
                 result = await _orig_invoke(self, query, *args, **kwargs)
@@ -534,12 +686,41 @@ async def _invoke(self, query, *args, **kwargs):
             except RPCError as e2:
                 if not _retryable(e2):
                     raise
-        if blamed is None:
+        if blamed is None and txt:       # step 2: keep the emoji that worked before, drop only the unproven ones
+            dropped, changed = set(), False
+            for _k, tgt, _a, old, ids in txt:
+                unproven = {i for i in ids if _id_ok.get(i, 0) == 0}
+                if unproven and len(unproven) < len(set(ids)):
+                    old_ids = {id(x) for x in (old or [])}
+                    tgt.entities = [x for x in tgt.entities if not (
+                        type(x) is raw.types.MessageEntityCustomEmoji and x.document_id in unproven and id(x) not in old_ids)]
+                    dropped |= unproven
+                    changed = True
+            if changed:
+                try:
+                    result = await _orig_invoke(self, query, *args, **kwargs)
+                    for i in dropped:
+                        _id_bad[i] = _id_bad.get(i, 0) + 1
+                    for _k, _t, _a, _o, ids in txt:
+                        for i in ids:
+                            if i not in dropped:
+                                _id_ok[i] = _id_ok.get(i, 0) + 1
+                    _forget_bad()
+                    blamed = "partial"
+                except RPCError as e3:
+                    if not _retryable(e3):
+                        raise
+        if blamed is None:               # step 3: everything plain
             _revert(undo, "txt")
             _revert(undo, "btn")
             result = await _orig_invoke(self, query, *args, **kwargs)   # raises again if it was something else
-            blamed = "txt" if "txt" in kinds else "btn"
-        await _blame(blamed, query.peer)
+            blamed = "txt" if txt else "btn"
+            for _k, _t, _a, _o, ids in txt:
+                for i in ids:
+                    _id_bad[i] = _id_bad.get(i, 0) + 1
+            _forget_bad()
+        if blamed != "partial":
+            await _blame(blamed, query.peer)
         return result
 
 
@@ -740,9 +921,9 @@ async def emoji_status_cmd(client, message: Message):
     listing = " ".join(m) if m else "—"
     await message.reply_text(
         f"<b>Premium emoji (text):</b> {'ON ✅' if _state['on'] else 'OFF ❌'}\n"
-        f"<b>Button icons:</b> {'ON ✅' if _state['btn_on'] else 'OFF ❌'}\n"
-        f"<b>Mapped:</b> {len(m)} (packs {len(_state['auto'])}, by hand {len(_state['manual'])})\n"
-        f"<b>Packs:</b> {', '.join(f'{n} ({c})' for n, c in _state['packs_ok'].items()) or '—'}\n\n{listing}\n\n"
-        "<code>/setemoji</code> · <code>/delemoji</code> · <code>/emojion</code> · <code>/emojioff</code> · "
-        "<code>/emojibtn on</code> · <code>/emojibtn off</code>"
+        f"<b>Button icons:</b> {'ON ✅' if _state['btn_on'] else 'OFF ❌'}\n\n"
+        f"{_report_text()}\n"
+        f"<b>Haath se set:</b> {len(_state['manual'])}\n\n"
+        "<code>/emojipack</code> · <code>/setemoji</code> · <code>/delemoji</code> · <code>/emojion</code> · "
+        "<code>/emojioff</code> · <code>/emojibtn on|off</code>"
     )
