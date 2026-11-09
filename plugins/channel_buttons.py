@@ -170,6 +170,8 @@ def _wants_buttons(message) -> bool:
 def _needs_repair(message) -> bool:
     """Our own two buttons on a post, but without their emoji (an earlier version stripped the emoji from
     the labels of channel buttons). They are rebuilt with the proper labels."""
+    if os.environ.get("PREMIUM_CHANNEL_BUTTONS", "").strip() in ("1", "true", "yes"):
+        return False   # premium icons ON for channels: the label text read back has no emoji on purpose
     rows = getattr(getattr(message, "reply_markup", None), "inline_keyboard", None)
     if not rows or message.empty or not (message.video or message.document or message.audio):
         return False
