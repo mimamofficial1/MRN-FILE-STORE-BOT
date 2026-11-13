@@ -153,6 +153,15 @@ async def _schedule_delete(client, chat_id, msg_ids, notice, delay, final_text):
         logger.error("Failed to schedule auto-delete", exc_info=True)
 
 
+# Button shown under the auto-delete reminder (and kept when the reminder turns into "deleted successfully")
+REMINDER_BUTTON_TEXT = "💎 ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ sᴜʙsᴄʀɪᴘᴛɪᴏɴ 💎"
+REMINDER_BUTTON_URL = "https://t.me/MRN_Officialx/6"
+
+
+def _reminder_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(REMINDER_BUTTON_TEXT, url=REMINDER_BUTTON_URL)]])
+
+
 async def _do_delete(client, chat_id, msg_ids, notice_id, final_text):
     """Delete the delivered messages (100 per request), then mark the reminder
     as done. Returns True only if everything was deleted."""
@@ -174,7 +183,7 @@ async def _do_delete(client, chat_id, msg_ids, notice_id, final_text):
             failed = True
     if not failed and notice_id:
         try:
-            await client.edit_message_text(chat_id, notice_id, final_text)
+            await client.edit_message_text(chat_id, notice_id, final_text, reply_markup=_reminder_markup())
         except Exception as e:
             logger.warning(f"[AUTO-DELETE] could not edit reminder in chat {chat_id}: {e}")
     logger.info(f"[AUTO-DELETE] chat {chat_id}: {deleted}/{len(msg_ids)} deleted, ok={not failed}")
@@ -734,7 +743,7 @@ async def start(client, message):
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
                 f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
                 f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
-            ))
+            ), reply_markup=_reminder_markup())
             await _schedule_delete(client, message.from_user.id, [x.id for x in filesarr], k,
                                    settings.get("auto_delete_time", 1800),
                                    "<b>Your All Files/Videos is successfully deleted!!!</b>")
@@ -816,7 +825,7 @@ async def start(client, message):
                 f"❤️ Save It Now, Enjoy It Later! 💫\n\n"
                 f"👨‍💻 Powered By @Mrn_Officialx ⚡\n\n"
                 f"🧑‍🔧 Help &amp; Support &gt;&gt;&gt; @Mrn_Contact_Bot</b>"
-            ))
+            ), reply_markup=_reminder_markup())
             await _schedule_delete(client, message.from_user.id, [del_msg.id], k,
                                    settings.get("auto_delete_time", 1800),
                                    "<b>Your File/Video is successfully deleted!!!</b>")
