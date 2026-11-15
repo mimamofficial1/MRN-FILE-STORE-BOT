@@ -155,7 +155,7 @@ async def _schedule_delete(client, chat_id, msg_ids, notice, delay, final_text):
 
 # Button shown under the auto-delete reminder (and kept when the reminder turns into "deleted successfully")
 REMINDER_BUTTON_TEXT = "💎 ʙᴜʏ ᴘʀᴇᴍɪᴜᴍ sᴜʙsᴄʀɪᴘᴛɪᴏɴ 💎"
-REMINDER_BUTTON_URL = "https://t.me/MRN_Officialx/6"
+REMINDER_BUTTON_URL = "https://t.me/Mrn_Officialx_Premium/1023"
 
 
 def _reminder_markup():
