@@ -338,7 +338,7 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
         await query.message.reply_text("<b>Send the new Force Subscribe message text.</b>\n/cancel to cancel.")
         ans = await client.ask(query.message.chat.id, "")
         if ans.text and ans.text.strip() != "/cancel":
-            await update_setting("force_sub_message", ans.text)
+            await update_setting("force_sub_message", ans.text.html)
             await ans.reply_text("<b>✅ Force Subscribe message updated.</b>")
         settings = await get_settings()
         await render_fsub_menu(query, settings, edit=False)
@@ -404,7 +404,7 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
         )
         ans = await client.ask(query.message.chat.id, "")
         if ans.text and ans.text.strip() != "/cancel":
-            await update_setting("custom_caption", ans.text)
+            await update_setting("custom_caption", ans.text.html)
             await ans.reply_text("<b>✅ Custom caption updated.</b>")
         settings = await get_settings()
         await render_caption_menu(query, settings, edit=False)
@@ -427,11 +427,13 @@ async def _settings_cb_inner(client: Client, query: CallbackQuery):
     elif data == "adm_start_edit":
         await query.message.reply_text(
             "<b>Send the new start message text.</b>\n\n"
-            "You can use <code>{}</code> <code>{}</code> as placeholders for user mention and bot mention (optional).\n/cancel to cancel."
+            "Placeholders (optional): <code>{mention}</code> for the user, <code>{bot}</code> for the bot - "
+            "or the old <code>{}</code> <code>{}</code> style (user first, then bot) still works too.\n"
+            "Formatting (bold, italic, etc.) you type is kept.\n/cancel to cancel."
         )
         ans = await client.ask(query.message.chat.id, "")
         if ans.text and ans.text.strip() != "/cancel":
-            await update_setting("start_message", ans.text)
+            await update_setting("start_message", ans.text.html)
             await ans.reply_text("<b>✅ Start message updated.</b>")
         settings = await get_settings()
         await render_start_menu(query, settings, edit=False)

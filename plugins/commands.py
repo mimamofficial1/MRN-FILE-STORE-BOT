@@ -362,6 +362,34 @@ async def _safe_copy(src, chat_id, caption=None, rows=None, protect=False, pacer
     raise last_error
 
 
+_PLACEHOLDER_RX = re.compile(r"\{([^{}]*)\}")
+_MENTION_ALIASES = {"mention", "user_mention", "user", "name", "first_name"}
+_BOT_ALIASES = {"bot_mention", "bot", "botname", "bot_name"}
+
+
+def render_start_text(text, user_mention, bot_mention):
+    """Fills in the start-message placeholders. Supports bare {} (filled in order: user, then
+    bot - the old positional style) AND named ones like {mention} / {bot_mention} (case-insensitive),
+    so whichever the admin typed in /settings works. Never raises - any other {something} (e.g. a
+    stray '{' typed by accident) is left exactly as written instead of breaking the message."""
+    state = {"i": 0}
+    positional = [user_mention, bot_mention]
+
+    def repl(m):
+        name = m.group(1).strip().lower()
+        if name == "":
+            i = state["i"]
+            state["i"] += 1
+            return positional[i] if i < len(positional) else m.group(0)
+        if name in _MENTION_ALIASES:
+            return user_mention
+        if name in _BOT_ALIASES:
+            return bot_mention
+        return m.group(0)
+
+    return _PLACEHOLDER_RX.sub(repl, text)
+
+
 async def _fetch_log_message(client, mid):
     """Fetch a stored message from LOG_CHANNEL. Re-resolves the channel if the
     bot's peer cache is empty (happens after a redeploy) and fails loudly if
@@ -572,10 +600,7 @@ async def start(client, message):
         reply_markup = InlineKeyboardMarkup(buttons)
         me = client.me
         start_caption = settings.get("start_message") or script.START_TXT
-        try:
-            start_caption = start_caption.format(message.from_user.mention, me.mention)
-        except (IndexError, KeyError):
-            pass
+        start_caption = render_start_text(start_caption, message.from_user.mention, me.mention)
         start_photo = settings.get("start_photo") or random.choice(PICS)
         try:
             await message.reply_photo(
@@ -927,10 +952,7 @@ async def cb_handler(client: Client, query: CallbackQuery):
         settings = await get_settings()
         me2 = (await client.get_me()).mention
         start_caption = settings.get("start_message") or script.START_TXT
-        try:
-            start_caption = start_caption.format(query.from_user.mention, me2)
-        except (IndexError, KeyError):
-            pass
+        start_caption = render_start_text(start_caption, query.from_user.mention, me2)
         start_photo = settings.get("start_photo") or random.choice(PICS)
         try:
             await client.edit_message_media(
