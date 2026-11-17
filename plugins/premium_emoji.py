@@ -20,7 +20,10 @@
 #     force-sub channels) so it has your style from the first minute,
 #   * any message / forwarded post with premium emoji that an ADMIN sends to the bot in private is learned too.
 # Emoji nobody could be matched with fall back to Telegram's own animated pack (DEFAULT_PACKS below).
-# Text emoji + button icons switch ON by themselves.
+# Text emoji switch ON by themselves. BUTTON icons stay OFF by default - that part of Telegram's
+# format is new and some accounts reject it, which made admin-panel buttons feel slow (it tried the
+# new format, timed out, then fell back to plain). Turn it on yourself with /emojibtn on, which
+# sends one test button first and only enables it if that test actually works.
 # Telegram limit: premium BUTTON icons are shown only in private/group/supergroup chats. Buttons on channel
 # posts keep their normal emoji (a bot needs an extra username bought on Fragment for more - then set PREMIUM_CHANNEL_BUTTONS=1).
 #
@@ -78,7 +81,7 @@ _UNRELATED = {
 }
 
 _state = {
-    "loaded": False, "on": True, "btn_on": True, "map": {}, "rx": None,
+    "loaded": False, "on": True, "btn_on": False, "map": {}, "rx": None,
     "txt_fails": 0, "btn_fails": 0,
     "manual": {},      # emoji you mapped by hand (/setemoji)  - highest priority
     "auto": {},        # emoji found in the packs
@@ -148,7 +151,7 @@ async def _load_state():
     # ON by default; only an explicit /emojioff, /emojibtn off or an automatic safety switch-off turns them off
     on, btn = st.get("premium_emoji"), st.get("premium_btn")
     _state["on"] = True if on is None else bool(on)
-    _state["btn_on"] = True if btn is None else bool(btn)
+    _state["btn_on"] = False if btn is None else bool(btn)   # opt-in: run /emojibtn on to try it
     manual = {}
     for pair in st.get("premium_emoji_map") or []:
         try:
@@ -913,8 +916,8 @@ async def _invoke(self, query, *args, **kwargs):
     call_kwargs = kwargs
     if "btn" in kinds:   # the new button format is only ever tried with a SHORT timeout, then plain
         call_kwargs = dict(kwargs)
-        call_kwargs.setdefault("retries", 2)
-        call_kwargs.setdefault("timeout", 12)
+        call_kwargs.setdefault("retries", 0)
+        call_kwargs.setdefault("timeout", 5)
     try:
         result = await _orig_invoke(self, query, *args, **call_kwargs)
         for k in kinds:

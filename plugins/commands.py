@@ -570,6 +570,7 @@ async def start(client, message):
         param = message.command[1] if len(message.command) == 2 else "-"
         buttons.append([InlineKeyboardButton("🔄 ᴛʀʏ ᴀɢᴀɪɴ", callback_data=f"fsub_verify:{param}")])
         fsub_text = settings.get("force_sub_message") or "<b>Please join our channel(s) to use this bot.</b>"
+        fsub_text = render_start_text(fsub_text, message.from_user.mention, client.me.mention)
         fsub_photo = settings.get("force_sub_photo")
         if fsub_photo:
             try:
