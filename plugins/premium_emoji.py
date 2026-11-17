@@ -64,7 +64,7 @@ DEFAULT_PACKS = [
 ]
 
 MAX_STYLE_PACKS = 12
-BACKFILL_POSTS = 200
+BACKFILL_POSTS = 60       # kept small: one get_messages batch per channel, not several
 MAX_PER_MESSAGE = 80
 MAX_MAPPINGS = 300
 AUTO_OFF_AFTER = 3
@@ -286,48 +286,27 @@ async def _learn_pairs(client, pairs, chat=None, last=None):
     return len(new_ids)
 
 
-async def _exists(client, chat, hi, size=50):
-    msgs = await client.get_messages(chat, list(range(max(1, hi - size + 1), hi + 1)))
-    return [m.id for m in msgs if not m.empty]
-
-
-async def _top_id(client, chat):
-    """Roughly the newest post id of a channel (bots cannot list history, but can ask for ids)."""
-    n = 50
-    if not await _exists(client, chat, n):
-        return 0
-    while n < (1 << 24):          # double until a stretch of 50 ids is completely empty
-        n *= 2
-        if not await _exists(client, chat, n):
-            break
-    lo, hi = n // 2, n            # ids just below `lo` exist, the stretch ending at `hi` is empty
-    while hi - lo > 50:
-        mid = (lo + hi) // 2
-        if await _exists(client, chat, mid):
-            lo = mid
-        else:
-            hi = mid
-    return max(await _exists(client, chat, lo, size=hi - lo + 50) or [0])
-
-
-async def _known_channels():
-    ids = set(_state["sources"])
+async def _known_last_ids():
+    """{channel id: newest post id} for every channel whose newest post id is ALREADY known for free -
+    no extra Telegram calls. Finding it from scratch (bots cannot list history) used to cost a dozen-plus
+    get_messages calls per channel at every restart; that was slowing the whole bot down, so it is gone.
+    Sources, cheapest first: our own memory of it, what channel_buttons.py has already tracked (its
+    auto-button catch-up needs the same number), and the live post the bot just received, if any."""
+    out = dict(_state["sources"])
     try:
-        from plugins.channel_buttons import _env_ids, _load_enabled
-        ids |= set(await _load_enabled()) | set(_env_ids)
+        from plugins.channel_buttons import _last as cb_last
+        for c, l in cb_last.items():
+            out[c] = max(out.get(c, 0), l)
     except Exception:
         pass
     try:
-        from plugins.settings_db import force_sub_channel_id
-        st = await get_settings()
-        for e in st.get("force_sub_channels") or []:
-            cid = force_sub_channel_id(e)
-            if isinstance(cid, int):
-                ids.add(cid)
+        from plugins.channel_buttons import _lastcol
+        async for d in _lastcol.find({}):
+            if isinstance(d.get("_id"), int) and d.get("last"):
+                out[d["_id"]] = max(out.get(d["_id"], 0), d["last"])
     except Exception:
         pass
-    ids = {c for c in ids if isinstance(c, int) and c < 0 and c != _log_channel_id_full()}
-    return ids
+    return {c: l for c, l in out.items() if c < 0 and c != _log_channel_id_full()}
 
 
 def _log_channel_id_full():
@@ -338,19 +317,18 @@ def _log_channel_id_full():
 
 
 async def _backfill(client):
-    """Read the last posts of the channels the bot knows, so your style is learned right at the start."""
+    """Read the newest few posts of the channels whose last post id we already know (see
+    _known_last_ids) - one get_messages batch each, nothing more, with a short pause between
+    channels so a bot with many channels can never burst into Telegram's rate limit at startup."""
     total = 0
-    for chat in sorted(await _known_channels()):
+    known = await _known_last_ids()
+    for i, (chat, top) in enumerate(sorted(known.items())):
+        if i:
+            await asyncio.sleep(1)
         try:
-            top = await _top_id(client, chat)
-            if not top:
-                continue
-            pairs = []
-            for hi in range(top, max(top - BACKFILL_POSTS, 0), -100):
-                msgs = await client.get_messages(chat, list(range(max(1, hi - 99), hi + 1)))
-                for m in msgs:
-                    if not m.empty:
-                        pairs += _pairs_from(m)
+            hi = top
+            msgs = await client.get_messages(chat, list(range(max(1, hi - BACKFILL_POSTS + 1), hi + 1)))
+            pairs = [p for m in msgs if not m.empty for p in _pairs_from(m)]
             if pairs:
                 total += await _learn_pairs(client, pairs, chat, top)
             else:
@@ -492,6 +470,7 @@ async def _autoload_packs(client):
                 ok[name] = len(got)
                 for k, v in got.items():
                     auto.setdefault(k, v)
+        from_pack = set(auto.values())   # ids straight from Telegram's own GetStickerSet - trusted, never re-checked
         try:
             _found, missing, refused = await _search_missing(client, auto)
             if refused:
@@ -502,19 +481,21 @@ async def _autoload_packs(client):
                     search = "ok (user session)" if not refused else "refused"
         except Exception as e:
             missing, search = [], f"error {type(e).__name__}"
-        valid = await _valid_ids(client, auto.values())
-        if valid is None and user:
-            valid = await _valid_ids(user, auto.values())
+        searched_ids = set(auto.values()) - from_pack   # only the emoji-search results get the extra check
         invalid = 0
-        # only trust the check if it confirms at least half of the ids; an empty / near-empty answer
-        # means the check itself is unreliable, and then nothing is thrown away
-        if valid is not None and len(valid) >= max(1, len(set(auto.values())) // 2):
-            for k in [k for k, v in auto.items() if v not in valid]:
-                del auto[k]
-                invalid += 1
-        elif valid is not None:
-            logger.info(f"[premium_emoji] id check confirmed only {len(valid)} of {len(set(auto.values()))} ids; "
-                        "ignoring the check")
+        if searched_ids:
+            valid = await _valid_ids(client, searched_ids)
+            if valid is None and user:
+                valid = await _valid_ids(user, searched_ids)
+            # only trust the check if it confirms at least half of the ids; an empty / near-empty answer
+            # means the check itself is unreliable, and then nothing is thrown away
+            if valid is not None and len(valid) >= max(1, len(searched_ids) // 2):
+                for k in [k for k, v in auto.items() if v in searched_ids and v not in valid]:
+                    del auto[k]
+                    invalid += 1
+            elif valid is not None:
+                logger.info(f"[premium_emoji] id check confirmed only {len(valid)} of {len(searched_ids)} "
+                            "searched ids; ignoring the check")
     finally:
         if user is not None:
             try:
